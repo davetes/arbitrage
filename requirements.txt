@@ -1,0 +1,9 @@
+Django==5.0.6
+aiogram==3.4.1
+binance-connector==3.6.0
+celery==5.4.0
+redis==5.0.1
+python-dotenv==1.0.1
+pydantic==2.5.3
+httpx==0.27.2
+uvicorn==0.30.5
