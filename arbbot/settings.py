@@ -105,6 +105,8 @@ MAX_NOTIONAL_USD = float(os.getenv("MAX_NOTIONAL_USD", 10000))
 SCAN_INTERVAL_SECONDS = int(os.getenv("SCAN_INTERVAL_SECONDS", 3))
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 ADMIN_TELEGRAM_ID = os.getenv("ADMIN_TELEGRAM_ID", "")
+# Safety flag: require explicit opt-in for live trading
+TRADING_ENABLED = os.getenv("TRADING_ENABLED", "False").lower() == "true"
 
 # Celery Beat schedule
 from celery.schedules import schedule

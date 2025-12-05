@@ -25,15 +25,28 @@ def _load_symbols(client: BinanceClient) -> Dict[str, dict]:
     return {s["symbol"]: s for s in info.get("symbols", []) if s.get("status") == "TRADING"}
 
 
-def _depth_best(client: BinanceClient, symbol: str) -> Optional[Tuple[float, float, float, float]]:
-    # returns (best_ask_price, best_ask_qty, best_bid_price, best_bid_qty)
+def _depth_snapshot(client: BinanceClient, symbol: str, depth: int = 20) -> Optional[dict]:
+    # returns dict with best prices and cumulative depth
     try:
-        d = client.depth(symbol, limit=5)
+        d = client.depth(symbol, limit=depth)
         if not d.get("asks") or not d.get("bids"):
             return None
         ask_p, ask_q = float(d["asks"][0][0]), float(d["asks"][0][1])
         bid_p, bid_q = float(d["bids"][0][0]), float(d["bids"][0][1])
-        return ask_p, ask_q, bid_p, bid_q
+        total_ask_qty = sum(float(q) for _, q in d["asks"])
+        total_bid_qty = sum(float(q) for _, q in d["bids"])
+        cap_ask_quote = sum(float(p) * float(q) for p, q in d["asks"])
+        cap_bid_quote = sum(float(p) * float(q) for p, q in d["bids"])
+        return {
+            "ask_price": ask_p,
+            "ask_qty": ask_q,
+            "bid_price": bid_p,
+            "bid_qty": bid_q,
+            "total_ask_qty": total_ask_qty,
+            "total_bid_qty": total_bid_qty,
+            "cap_ask_quote": cap_ask_quote,
+            "cap_bid_quote": cap_bid_quote,
+        }
     except Exception:
         return None
 
@@ -51,65 +64,65 @@ def _try_triangle(client: BinanceClient, symbols: Dict[str, dict], base: str, x:
     # Leg 1: buy X with BASE (prefer XBASE ask); if only BASEX exists, sell BASE for X via BASEX bid
     leg1_label = None
     if pair1 in symbols:
-        d1 = _depth_best(client, pair1)
+        d1 = _depth_snapshot(client, pair1)
         if not d1:
             return None
-        p1_ask, q1_ask, _, _ = d1
+        p1_ask, q1_ask = d1["ask_price"], d1["ask_qty"]
         # 1 unit BASE buys BASE/p1_ask units of X
         base_to_x = 1.0 / p1_ask
-        cap1_usd = p1_ask * q1_ask  # in BASE (assuming BASE is USDT)
+        cap1_usd = d1["cap_ask_quote"]  # quote notional depth
         leg1_label = f"{x}/{base} buy"
     elif pair1_inv in symbols:
-        d1 = _depth_best(client, pair1_inv)
+        d1 = _depth_snapshot(client, pair1_inv)
         if not d1:
             return None
-        _, _, p1_bid, q1_bid = d1
+        p1_bid, q1_bid = d1["bid_price"], d1["bid_qty"]
         # Sell BASE to receive X at bid: 1 BASE sells for 1/p1_bid X
         base_to_x = 1.0 / p1_bid
-        cap1_usd = p1_bid * q1_bid
+        cap1_usd = d1["cap_bid_quote"]
         leg1_label = f"{base}/{x} sell"
     else:
         return None
 
     # Leg 2: convert X to Y using XY or YX
     if pair2_xy in symbols:
-        d2 = _depth_best(client, pair2_xy)
+        d2 = _depth_snapshot(client, pair2_xy)
         if not d2:
             return None
-        _, _, p2_bid, q2_bid = d2
+        p2_bid, q2_bid = d2["bid_price"], d2["bid_qty"]
         # Sell X to get Y at bid
         x_to_y = p2_bid
-        # capacity in X is q2_bid
-        cap2_x = q2_bid
+        # capacity in X is total bid qty
+        cap2_x = d2["total_bid_qty"]
         leg2_label = f"{y}/{x} buy"  # equivalent of selling X for Y on XY
     elif pair2_yx in symbols:
-        d2 = _depth_best(client, pair2_yx)
+        d2 = _depth_snapshot(client, pair2_yx)
         if not d2:
             return None
-        p2_ask, q2_ask, _, _ = d2
+        p2_ask, q2_ask = d2["ask_price"], d2["ask_qty"]
         # Buy X->Y using YX ask: X amount buys X/p2_ask of Y
         x_to_y = 1.0 / p2_ask
-        cap2_x = q2_ask * p2_ask  # Y qty ask -> max X you can spend ~ ask_qty*ask_price
+        cap2_x = d2["total_ask_qty"] * p2_ask  # convert Y qty to X spend roughly
         leg2_label = f"{x}/{y} buy"
     else:
         return None
 
     # Leg 3: convert Y to BASE
     if pair3 in symbols:
-        d3 = _depth_best(client, pair3)
+        d3 = _depth_snapshot(client, pair3)
         if not d3:
             return None
-        _, _, p3_bid, q3_bid = d3
+        p3_bid, q3_bid = d3["bid_price"], d3["bid_qty"]
         y_to_base = p3_bid
-        cap3_y = q3_bid
+        cap3_y = d3["total_bid_qty"]
         leg3_label = f"{y}/{base} sell"
     elif pair3_inv in symbols:
-        d3 = _depth_best(client, pair3_inv)
+        d3 = _depth_snapshot(client, pair3_inv)
         if not d3:
             return None
-        p3_ask, q3_ask, _, _ = d3
+        p3_ask, q3_ask = d3["ask_price"], d3["ask_qty"]
         y_to_base = 1.0 / p3_ask
-        cap3_y = q3_ask * p3_ask
+        cap3_y = d3["total_ask_qty"] * p3_ask
         leg3_label = f"{base}/{y} buy"
     else:
         return None
@@ -127,7 +140,7 @@ def _try_triangle(client: BinanceClient, symbols: Dict[str, dict], base: str, x:
     if profit_pct < S.MIN_PROFIT_PCT or profit_pct > S.MAX_PROFIT_PCT:
         return None
 
-    # Rough capacity estimation using top-of-book only
+    # Capacity estimation using shallow depth snapshot
     # Determine max BASE notional respecting leg capacities
     # Leg1 cap in BASE: cap1_usd
     # Leg2 cap in BASE: cap2_x converted to BASE via inverse of leg1 rate (approx)
