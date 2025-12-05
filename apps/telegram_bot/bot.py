@@ -3,6 +3,7 @@ import os
 import sys
 import django
 from pathlib import Path
+import logging
 
 BASE_DIR = Path(__file__).resolve().parents[2]
 # Ensure project root is importable so 'arbbot' package can be found
@@ -13,7 +14,7 @@ django.setup()
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import CommandStart
-from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
+from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton, BotCommand
 from aiogram.exceptions import TelegramBadRequest
 from django.utils import timezone
 from arbbot import settings as S
@@ -39,17 +40,52 @@ def kb_route(route_id: int):
 
 
 async def main():
+    logging.basicConfig(level=logging.DEBUG, format="[%(asctime)s] %(levelname)s %(name)s: %(message)s")
+    # Increase verbosity for aiogram and HTTP stacks
+    logging.getLogger("aiogram").setLevel(logging.DEBUG)
+    logging.getLogger("aiohttp.client").setLevel(logging.DEBUG)
+    logging.getLogger("aiohttp.client.pool").setLevel(logging.DEBUG)
+    logging.getLogger("urllib3").setLevel(logging.DEBUG)
+    logging.getLogger("httpx").setLevel(logging.DEBUG)
+    logging.info("Starting Telegram bot...")
     bot = Bot(token=S.TELEGRAM_BOT_TOKEN)
     dp = Dispatcher()
+
+    # Set bot menu commands
+    commands = [
+        BotCommand(command="start", description="Start the arbitrage bot"),
+        BotCommand(command="config", description="Configure your bot settings"),
+        BotCommand(command="triangular_alerts", description="Get triangular arbitrage alerts"),
+        BotCommand(command="direct_alerts", description="Get direct arbitrage alerts"),
+        BotCommand(command="transaction_history", description="Get transaction history"),
+    ]
+    await bot.set_my_commands(commands)
 
     @dp.message(CommandStart())
     async def on_start(msg: Message):
         cfg, _ = await sync_to_async(BotSettings.objects.get_or_create)(id=1)
         reply_kb = await kb_global()
+        logging.info(f"/start from chat_id={msg.chat.id} username={getattr(msg.from_user, 'username', '')}")
         await msg.answer(
             "Arbitrage bot ready. Use buttons to control scanning.",
             reply_markup=reply_kb,
         )
+
+    @dp.message(F.text == "/config")
+    async def on_config(msg: Message):
+        await msg.answer("Open Django admin at /admin or use buttons to toggle scanning. In-bot settings will be added soon.")
+
+    @dp.message(F.text == "/triangular_alerts")
+    async def on_tri_alerts(msg: Message):
+        await msg.answer("You will receive triangular arbitrage route messages here when found.")
+
+    @dp.message(F.text == "/direct_alerts")
+    async def on_direct_alerts(msg: Message):
+        await msg.answer("Direct arbitrage alerts are not implemented yet. We'll add them after triangular flow.")
+
+    @dp.message(F.text == "/transaction_history")
+    async def on_tx_history(msg: Message):
+        await msg.answer("Execution history will be available in Django admin and here soon.")
 
     @dp.callback_query(F.data == "toggle_scan")
     async def toggle_scan(cb: CallbackQuery):
@@ -62,6 +98,7 @@ async def main():
         except TelegramBadRequest:
             # If markup/content are the same, ignore the error
             pass
+        logging.info(f"Scanning toggled to {cfg.scanning_enabled} by chat_id={cb.from_user.id}")
         await cb.answer("Scanning toggled")
 
     @dp.callback_query(F.data.startswith("check:"))
@@ -76,6 +113,7 @@ async def main():
         if not new_cand:
             await cb.answer("Not valid now", show_alert=True)
         else:
+            logging.info(f"Route {route_id} revalidated: profit={new_cand.profit_pct}% volume=${new_cand.volume_usd}")
             text = f"Route: {new_cand.a} → {new_cand.b} → {new_cand.c}\nProfit: {new_cand.profit_pct:.2f}%\nVolume: ${new_cand.volume_usd:,.0f}"
             await cb.message.edit_text(text, reply_markup=kb_route(route_id))
             await cb.answer("Revalidated")
@@ -99,8 +137,10 @@ async def main():
         ex.pnl_usd = 0.0
         ex.finished_at = timezone.now()
         await sync_to_async(ex.save)()
+        logging.info(f"Executed placeholder for route {route_id} notional=${ex.notional_usd}")
         await cb.answer("Executed (placeholder)")
 
+    logging.info("Bot is running. Press Ctrl+C to stop.")
     await dp.start_polling(bot)
 
 
