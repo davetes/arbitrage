@@ -55,6 +55,11 @@ if cfg.max_notional_usd != S.MAX_NOTIONAL_USD:
     cfg.max_notional_usd = S.MAX_NOTIONAL_USD
     updated = True
 
+if not cfg.bot_language or cfg.bot_language != S.BOT_LANGUAGE:
+    cfg.bot_language = S.BOT_LANGUAGE
+    updated = True
+    print(f"✅ Updated bot_language to {S.BOT_LANGUAGE}")
+
 if updated:
     cfg.save()
     print("\n✅ Settings synced from .env!")
@@ -68,5 +73,6 @@ print(f"  max_profit_pct: {cfg.max_profit_pct}")
 print(f"  base_asset: {cfg.base_asset}")
 print(f"  min_notional_usd: {cfg.min_notional_usd}")
 print(f"  max_notional_usd: {cfg.max_notional_usd}")
+print(f"  bot_language: {cfg.bot_language}")
 
 

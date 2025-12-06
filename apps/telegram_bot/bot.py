@@ -25,10 +25,23 @@ from asgiref.sync import sync_to_async
 from apps.core.tasks import scan_triangular_routes
 
 
-def t(key: str) -> str:
+def t(key: str, lang: str = None) -> str:
+    """Translation function. If lang is None, uses database or .env"""
+    if lang is None:
+        # Try to get from database (for use in async handlers)
+        try:
+            from apps.core.models import BotSettings
+            cfg = BotSettings.objects.filter(id=1).first()
+            if cfg and cfg.bot_language:
+                lang = cfg.bot_language
+            else:
+                lang = S.BOT_LANGUAGE
+        except Exception:
+            lang = S.BOT_LANGUAGE
     ru = {
         "ready": "Бот готов. Используйте кнопки, чтобы управлять сканированием.",
-        "config": "Откройте Django admin (/admin) или используйте кнопки. Встроенные настройки будут позже.",
+        "config": "Настройки бота",
+        "config_menu": "⚙️ Настройки бота\n\nВыберите параметр для изменения:",
         "tri": "Здесь вы будете получать маршруты треугольного арбитража.",
         "direct": "Прямой арбитраж пока не реализован.",
         "history": "История сделок будет доступна позже.",
@@ -48,10 +61,27 @@ def t(key: str) -> str:
         "stop_search": "Остановить поиск",
         "check": "Проверить актуальность",
         "exec": "Исполнить сделку",
+        "settings_saved": "Настройки сохранены",
+        "min_profit": "Мин. прибыль",
+        "max_profit": "Макс. прибыль",
+        "min_notional": "Мин. сумма",
+        "max_notional": "Макс. сумма",
+        "back": "Назад",
+        "current_value": "Текущее значение",
+        "enter_new_value": "Введите новое значение",
+        "language": "Язык",
+        "scanning": "Сканирование",
+        "base_asset": "Базовый актив",
+        "select_language": "Выберите язык:",
+        "select_preset": "Выберите значение:",
+        "enabled": "Включено",
+        "disabled": "Выключено",
+        "toggle_scanning": "Переключить сканирование",
     }
     en = {
         "ready": "Arbitrage bot ready. Use buttons to control scanning.",
-        "config": "Open Django admin at /admin or use buttons. In-bot settings coming soon.",
+        "config": "Bot Settings",
+        "config_menu": "⚙️ Bot Settings\n\nSelect parameter to change:",
         "tri": "You will receive triangular arbitrage route messages here when found.",
         "direct": "Direct arbitrage alerts are not implemented yet.",
         "history": "Execution history will be available soon.",
@@ -71,32 +101,110 @@ def t(key: str) -> str:
         "stop_search": "Stop Search",
         "check": "Check Validity",
         "exec": "Execute Trade",
+        "settings_saved": "Settings saved",
+        "min_profit": "Min Profit %",
+        "max_profit": "Max Profit %",
+        "min_notional": "Min Notional $",
+        "max_notional": "Max Notional $",
+        "back": "Back",
+        "current_value": "Current value",
+        "enter_new_value": "Enter new value",
+        "language": "Language",
+        "scanning": "Scanning",
+        "base_asset": "Base Asset",
+        "select_language": "Select language:",
+        "select_preset": "Select a preset value:",
+        "enabled": "Enabled",
+        "disabled": "Disabled",
+        "toggle_scanning": "Toggle Scanning",
     }
-    return ru.get(key) if S.BOT_LANGUAGE.lower().startswith("ru") else en.get(key)
+    return ru.get(key) if lang and lang.lower().startswith("ru") else en.get(key)
 
 
 async def kb_global():
     cfg, _ = await sync_to_async(BotSettings.objects.get_or_create)(id=1)
+    lang = cfg.bot_language if cfg.bot_language else S.BOT_LANGUAGE
     if cfg.scanning_enabled:
-        return InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text=t("stop_search"), callback_data="toggle_scan")]])
+        return InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text=t("stop_search", lang), callback_data="toggle_scan")]])
     else:
-        return InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text=t("start_search"), callback_data="toggle_scan")]])
+        return InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text=t("start_search", lang), callback_data="toggle_scan")]])
 
 
-def kb_route(route_id: int):
+def kb_route(route_id: int, lang: str = None):
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text=t("check"), callback_data=f"check:{route_id}")],
-        [InlineKeyboardButton(text=t("exec"), callback_data=f"exec:{route_id}")],
+        [InlineKeyboardButton(text=t("check", lang), callback_data=f"check:{route_id}")],
+        [InlineKeyboardButton(text=t("exec", lang), callback_data=f"exec:{route_id}")],
     ])
 
 
-def kb_confirm(route_id: int):
+def kb_confirm(route_id: int, lang: str = None):
     return InlineKeyboardMarkup(inline_keyboard=[
         [
-            InlineKeyboardButton(text=t("confirm_btn"), callback_data=f"execok:{route_id}"),
-            InlineKeyboardButton(text=t("cancel_btn"), callback_data=f"execcancel:{route_id}"),
+            InlineKeyboardButton(text=t("confirm_btn", lang), callback_data=f"execok:{route_id}"),
+            InlineKeyboardButton(text=t("cancel_btn", lang), callback_data=f"execcancel:{route_id}"),
         ]
     ])
+
+
+def kb_settings_menu(lang: str = None):
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=t("min_profit", lang), callback_data="config:min_profit")],
+        [InlineKeyboardButton(text=t("max_profit", lang), callback_data="config:max_profit")],
+        [InlineKeyboardButton(text=t("min_notional", lang), callback_data="config:min_notional")],
+        [InlineKeyboardButton(text=t("max_notional", lang), callback_data="config:max_notional")],
+        [InlineKeyboardButton(text="🌐 " + t("language", lang), callback_data="config:language")],
+        [InlineKeyboardButton(text="🔄 " + t("toggle_scanning", lang), callback_data="config:toggle_scan")],
+        [InlineKeyboardButton(text="🔙 " + t("back", lang), callback_data="config:back")],
+    ])
+
+
+def kb_setting_presets(setting: str, current_val: float, unit: str, lang: str = None):
+    """Create preset buttons for a setting"""
+    if "%" in unit:
+        # Profit percentage presets
+        presets = [0.01, 0.1, 0.5, 1.0, 2.0, 2.5, 5.0]
+    else:
+        # Notional USD presets
+        presets = [1, 10, 50, 100, 500, 1000, 5000, 10000]
+    
+    buttons = []
+    row = []
+    for preset in presets:
+        if abs(preset - current_val) < 0.01:
+            label = f"✓ {preset}{unit}"
+        else:
+            label = f"{preset}{unit}"
+        row.append(InlineKeyboardButton(
+            text=label,
+            callback_data=f"set:{setting}:{preset}"
+        ))
+        if len(row) == 2:
+            buttons.append(row)
+            row = []
+    if row:
+        buttons.append(row)
+    buttons.append([InlineKeyboardButton(text="🔙 " + t("back", lang), callback_data="config:back")])
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+
+def kb_language_presets(current_lang: str, lang: str = None):
+    """Create language selection buttons"""
+    languages = [
+        ("en", "English", "🇬🇧"),
+        ("ru", "Русский", "🇷🇺"),
+    ]
+    buttons = []
+    for code, name, flag in languages:
+        if code == current_lang:
+            label = f"✓ {flag} {name}"
+        else:
+            label = f"{flag} {name}"
+        buttons.append([InlineKeyboardButton(
+            text=label,
+            callback_data=f"set:language:{code}"
+        )])
+    buttons.append([InlineKeyboardButton(text="🔙 " + t("back", lang), callback_data="config:back")])
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
 
 
 async def main():
@@ -124,32 +232,61 @@ async def main():
     @dp.message(CommandStart())
     async def on_start(msg: Message):
         cfg, _ = await sync_to_async(BotSettings.objects.get_or_create)(id=1)
+        if not cfg.bot_language:
+            cfg.bot_language = S.BOT_LANGUAGE
+            await sync_to_async(cfg.save)()
+        lang = cfg.bot_language
         reply_kb = await kb_global()
         logging.info(f"/start from chat_id={msg.chat.id} username={getattr(msg.from_user, 'username', '')}")
         await msg.answer(
-            t("ready"),
+            t("ready", lang),
             reply_markup=reply_kb,
         )
 
     @dp.message(F.text == "/config")
     async def on_config(msg: Message):
-        await msg.answer(t("config"))
+        cfg, _ = await sync_to_async(BotSettings.objects.get_or_create)(id=1)
+        if not cfg.bot_language:
+            cfg.bot_language = S.BOT_LANGUAGE
+            await sync_to_async(cfg.save)()
+        lang = cfg.bot_language
+        lang_display = "🇷🇺 Русский" if lang == "ru" else "🇬🇧 English"
+        scanning_status = f"✅ {t('enabled', lang)}" if cfg.scanning_enabled else f"❌ {t('disabled', lang)}"
+        text = (
+            f"{t('config_menu', lang)}\n\n"
+            f"📊 {t('min_profit', lang)}: {cfg.min_profit_pct}%\n"
+            f"📊 {t('max_profit', lang)}: {cfg.max_profit_pct}%\n"
+            f"💰 {t('min_notional', lang)}: ${cfg.min_notional_usd:,.0f}\n"
+            f"💰 {t('max_notional', lang)}: ${cfg.max_notional_usd:,.0f}\n"
+            f"🌐 {t('language', lang)}: {lang_display}\n"
+            f"🔄 {t('scanning', lang)}: {scanning_status}\n"
+            f"💱 {t('base_asset', lang)}: {cfg.base_asset}"
+        )
+        await msg.answer(text, reply_markup=kb_settings_menu(lang))
 
     @dp.message(F.text == "/triangular_alerts")
     async def on_tri_alerts(msg: Message):
-        await msg.answer(t("tri"))
+        cfg, _ = await sync_to_async(BotSettings.objects.get_or_create)(id=1)
+        lang = cfg.bot_language if cfg.bot_language else S.BOT_LANGUAGE
+        await msg.answer(t("tri", lang))
 
     @dp.message(F.text == "/direct_alerts")
     async def on_direct_alerts(msg: Message):
-        await msg.answer(t("direct"))
+        cfg, _ = await sync_to_async(BotSettings.objects.get_or_create)(id=1)
+        lang = cfg.bot_language if cfg.bot_language else S.BOT_LANGUAGE
+        await msg.answer(t("direct", lang))
 
     @dp.message(F.text == "/transaction_history")
     async def on_tx_history(msg: Message):
-        await msg.answer(t("history"))
+        cfg, _ = await sync_to_async(BotSettings.objects.get_or_create)(id=1)
+        lang = cfg.bot_language if cfg.bot_language else S.BOT_LANGUAGE
+        await msg.answer(t("history", lang))
+
 
     @dp.callback_query(F.data == "toggle_scan")
     async def toggle_scan(cb: CallbackQuery):
         cfg, _ = await sync_to_async(BotSettings.objects.get_or_create)(id=1)
+        lang = cfg.bot_language if cfg.bot_language else S.BOT_LANGUAGE
         cfg.scanning_enabled = not cfg.scanning_enabled
         await sync_to_async(cfg.save)()
         reply_kb = await kb_global()
@@ -159,37 +296,41 @@ async def main():
             # If markup/content are the same, ignore the error
             pass
         logging.info(f"Scanning toggled to {cfg.scanning_enabled} by chat_id={cb.from_user.id}")
-        await cb.answer(t("toggle"))
+        await cb.answer(t("toggle", lang))
 
     @dp.callback_query(F.data.startswith("check:"))
     async def check_route(cb: CallbackQuery):
+        cfg, _ = await sync_to_async(BotSettings.objects.get_or_create)(id=1)
+        lang = cfg.bot_language if cfg.bot_language else S.BOT_LANGUAGE
         route_id = int(cb.data.split(":")[1])
         r = await sync_to_async(lambda: Route.objects.filter(id=route_id).first())()
         if not r:
-            await cb.answer(t("route_missing"), show_alert=True)
+            await cb.answer(t("route_missing", lang), show_alert=True)
             return
         cand = CandidateRoute(a=r.leg_a, b=r.leg_b, c=r.leg_c, profit_pct=r.profit_pct, volume_usd=r.volume_usd)
         new_cand = revalidate_route(cand)
         if not new_cand:
-            await cb.answer(t("not_valid"), show_alert=True)
+            await cb.answer(t("not_valid", lang), show_alert=True)
         else:
             logging.info(f"Route {route_id} revalidated: profit={new_cand.profit_pct}% volume=${new_cand.volume_usd}")
             text = f"Route: {new_cand.a} → {new_cand.b} → {new_cand.c}\nProfit: {new_cand.profit_pct:.2f}%\nVolume: ${new_cand.volume_usd:,.0f}"
-            await cb.message.edit_text(text, reply_markup=kb_route(route_id))
-            await cb.answer(t("revalidated"))
+            await cb.message.edit_text(text, reply_markup=kb_route(route_id, lang))
+            await cb.answer(t("revalidated", lang))
 
     @dp.callback_query(F.data.startswith("exec:"))
     async def exec_route(cb: CallbackQuery):
+        cfg, _ = await sync_to_async(BotSettings.objects.get_or_create)(id=1)
+        lang = cfg.bot_language if cfg.bot_language else S.BOT_LANGUAGE
         route_id = int(cb.data.split(":")[1])
         r = await sync_to_async(lambda: Route.objects.filter(id=route_id).first())()
         if not r:
-            await cb.answer(t("route_missing"), show_alert=True)
+            await cb.answer(t("route_missing", lang), show_alert=True)
             return
         # Revalidate before execution
         cand = CandidateRoute(a=r.leg_a, b=r.leg_b, c=r.leg_c, profit_pct=r.profit_pct, volume_usd=r.volume_usd)
         new_cand = revalidate_route(cand)
         if not new_cand:
-            await cb.answer(t("not_valid"), show_alert=True)
+            await cb.answer(t("not_valid", lang), show_alert=True)
             return
         
         # Calculate executable amount: min(route_volume, max_notional, account_balance)
@@ -202,34 +343,192 @@ async def main():
         notional = min(new_cand.volume_usd, S.MAX_NOTIONAL_USD, available_balance)
         
         text = (
-            f"{t('confirm_title')}\n"
+            f"{t('confirm_title', lang)}\n"
             f"Route: {new_cand.a} → {new_cand.b} → {new_cand.c}\n"
             f"Profit: {new_cand.profit_pct:.2f}%\n"
             f"Available balance: ${available_balance:,.2f}\n"
             f"Planned notional: ${notional:,.2f}"
         )
-        await cb.message.edit_text(text, reply_markup=kb_confirm(route_id))
-        await cb.answer(t("exec_started"))
+        await cb.message.edit_text(text, reply_markup=kb_confirm(route_id, lang))
+        await cb.answer(t("exec_started", lang))
 
     @dp.callback_query(F.data.startswith("execcancel:"))
     async def exec_cancel(cb: CallbackQuery):
-        await cb.answer(t("cancelled"))
-        await cb.message.edit_text(t("cancelled"))
+        cfg, _ = await sync_to_async(BotSettings.objects.get_or_create)(id=1)
+        lang = cfg.bot_language if cfg.bot_language else S.BOT_LANGUAGE
+        await cb.answer(t("cancelled", lang))
+        await cb.message.edit_text(t("cancelled", lang))
+
+    @dp.callback_query(F.data == "config:back")
+    async def config_back(cb: CallbackQuery):
+        cfg, _ = await sync_to_async(BotSettings.objects.get_or_create)(id=1)
+        if not cfg.bot_language:
+            cfg.bot_language = S.BOT_LANGUAGE
+            await sync_to_async(cfg.save)()
+        lang = cfg.bot_language
+        lang_display = "🇷🇺 Русский" if lang == "ru" else "🇬🇧 English"
+        scanning_status = f"✅ {t('enabled', lang)}" if cfg.scanning_enabled else f"❌ {t('disabled', lang)}"
+        text = (
+            f"{t('config_menu', lang)}\n\n"
+            f"📊 {t('min_profit', lang)}: {cfg.min_profit_pct}%\n"
+            f"📊 {t('max_profit', lang)}: {cfg.max_profit_pct}%\n"
+            f"💰 {t('min_notional', lang)}: ${cfg.min_notional_usd:,.0f}\n"
+            f"💰 {t('max_notional', lang)}: ${cfg.max_notional_usd:,.0f}\n"
+            f"🌐 {t('language', lang)}: {lang_display}\n"
+            f"🔄 {t('scanning', lang)}: {scanning_status}\n"
+            f"💱 {t('base_asset', lang)}: {cfg.base_asset}"
+        )
+        await cb.message.edit_text(text, reply_markup=kb_settings_menu(lang))
+        await cb.answer()
+
+    @dp.callback_query(F.data.startswith("config:"))
+    async def config_setting(cb: CallbackQuery):
+        setting = cb.data.split(":")[1]
+        if setting == "back":
+            return  # Handled separately
+        
+        cfg, _ = await sync_to_async(BotSettings.objects.get_or_create)(id=1)
+        if not cfg.bot_language:
+            cfg.bot_language = S.BOT_LANGUAGE
+            await sync_to_async(cfg.save)()
+        lang = cfg.bot_language
+        
+        if setting == "toggle_scan":
+            cfg.scanning_enabled = not cfg.scanning_enabled
+            await sync_to_async(cfg.save)()
+            scanning_status_text = t('enabled', lang) if cfg.scanning_enabled else t('disabled', lang)
+            await cb.answer(f"{t('scanning', lang)} {scanning_status_text}")
+            
+            # Return to config menu
+            lang_display = "🇷🇺 Русский" if lang == "ru" else "🇬🇧 English"
+            scanning_status = f"✅ {t('enabled', lang)}" if cfg.scanning_enabled else f"❌ {t('disabled', lang)}"
+            text = (
+                f"{t('config_menu', lang)}\n\n"
+                f"📊 {t('min_profit', lang)}: {cfg.min_profit_pct}%\n"
+                f"📊 {t('max_profit', lang)}: {cfg.max_profit_pct}%\n"
+                f"💰 {t('min_notional', lang)}: ${cfg.min_notional_usd:,.0f}\n"
+                f"💰 {t('max_notional', lang)}: ${cfg.max_notional_usd:,.0f}\n"
+                f"🌐 {t('language', lang)}: {lang_display}\n"
+                f"🔄 {t('scanning', lang)}: {scanning_status}\n"
+                f"💱 {t('base_asset', lang)}: {cfg.base_asset}"
+            )
+            await cb.message.edit_text(text, reply_markup=kb_settings_menu(lang))
+            return
+        
+        if setting == "language":
+            current_lang = cfg.bot_language or S.BOT_LANGUAGE
+            lang_display = "🇷🇺 Русский" if current_lang == "ru" else "🇬🇧 English"
+            text = (
+                f"🌐 {t('language', lang)}\n\n"
+                f"{t('current_value', lang)}: {lang_display}\n\n"
+                f"{t('select_language', lang)}"
+            )
+            await cb.message.edit_text(text, reply_markup=kb_language_presets(current_lang, lang))
+            await cb.answer()
+            return
+        
+        setting_info = {
+            "min_profit": (cfg.min_profit_pct, "min_profit_pct", "%", t("min_profit", lang)),
+            "max_profit": (cfg.max_profit_pct, "max_profit_pct", "%", t("max_profit", lang)),
+            "min_notional": (cfg.min_notional_usd, "min_notional_usd", "$", t("min_notional", lang)),
+            "max_notional": (cfg.max_notional_usd, "max_notional_usd", "$", t("max_notional", lang)),
+        }
+        
+        if setting not in setting_info:
+            await cb.answer("Unknown setting", show_alert=True)
+            return
+        
+        current_val, field_name, unit, setting_label = setting_info[setting]
+        text = (
+            f"⚙️ {setting_label}\n\n"
+            f"{t('current_value', lang)}: {current_val}{unit}\n\n"
+            f"{t('select_preset', lang)}"
+        )
+        
+        await cb.message.edit_text(text, reply_markup=kb_setting_presets(setting, current_val, unit, lang))
+        await cb.answer()
+
+    @dp.callback_query(F.data.startswith("set:"))
+    async def set_value(cb: CallbackQuery):
+        parts = cb.data.split(":")
+        if len(parts) != 3:
+            await cb.answer("Invalid format", show_alert=True)
+            return
+        
+        setting = parts[1]
+        new_value_str = parts[2]
+        
+        cfg, _ = await sync_to_async(BotSettings.objects.get_or_create)(id=1)
+        if not cfg.bot_language:
+            cfg.bot_language = S.BOT_LANGUAGE
+            await sync_to_async(cfg.save)()
+        lang = cfg.bot_language
+        
+        # Handle language setting (string, not float)
+        if setting == "language":
+            if new_value_str not in ["en", "ru"]:
+                await cb.answer("Invalid language", show_alert=True)
+                return
+            cfg.bot_language = new_value_str
+            await sync_to_async(cfg.save)()
+            lang = new_value_str  # Update lang for response
+            lang_display = "🇷🇺 Русский" if new_value_str == "ru" else "🇬🇧 English"
+            await cb.answer(f"{t('settings_saved', lang)}: {lang_display}")
+        else:
+            # Handle numeric settings
+            try:
+                new_value = float(new_value_str)
+            except ValueError:
+                await cb.answer("Invalid value", show_alert=True)
+                return
+            
+            setting_map = {
+                "min_profit": ("min_profit_pct", "%"),
+                "max_profit": ("max_profit_pct", "%"),
+                "min_notional": ("min_notional_usd", "$"),
+                "max_notional": ("max_notional_usd", "$"),
+            }
+            
+            if setting not in setting_map:
+                await cb.answer("Unknown setting", show_alert=True)
+                return
+            
+            field_name, unit = setting_map[setting]
+            setattr(cfg, field_name, new_value)
+            await sync_to_async(cfg.save)()
+            await cb.answer(f"{t('settings_saved', lang)}: {new_value}{unit}")
+        
+        # Return to config menu with updated language
+        lang_display = "🇷🇺 Русский" if lang == "ru" else "🇬🇧 English"
+        scanning_status = f"✅ {t('enabled', lang)}" if cfg.scanning_enabled else f"❌ {t('disabled', lang)}"
+        text = (
+            f"{t('config_menu', lang)}\n\n"
+            f"📊 {t('min_profit', lang)}: {cfg.min_profit_pct}%\n"
+            f"📊 {t('max_profit', lang)}: {cfg.max_profit_pct}%\n"
+            f"💰 {t('min_notional', lang)}: ${cfg.min_notional_usd:,.0f}\n"
+            f"💰 {t('max_notional', lang)}: ${cfg.max_notional_usd:,.0f}\n"
+            f"🌐 {t('language', lang)}: {lang_display}\n"
+            f"🔄 {t('scanning', lang)}: {scanning_status}\n"
+            f"💱 {t('base_asset', lang)}: {cfg.base_asset}"
+        )
+        await cb.message.edit_text(text, reply_markup=kb_settings_menu(lang))
 
     @dp.callback_query(F.data.startswith("execok:"))
     async def exec_ok(cb: CallbackQuery):
+        cfg, _ = await sync_to_async(BotSettings.objects.get_or_create)(id=1)
+        lang = cfg.bot_language if cfg.bot_language else S.BOT_LANGUAGE
         route_id = int(cb.data.split(":")[1])
         r = await sync_to_async(lambda: Route.objects.filter(id=route_id).first())()
         if not r:
-            await cb.answer(t("route_missing"), show_alert=True)
+            await cb.answer(t("route_missing", lang), show_alert=True)
             return
         cand = CandidateRoute(a=r.leg_a, b=r.leg_b, c=r.leg_c, profit_pct=r.profit_pct, volume_usd=r.volume_usd)
         new_cand = revalidate_route(cand)
         if not new_cand:
-            await cb.answer(t("not_valid"), show_alert=True)
+            await cb.answer(t("not_valid", lang), show_alert=True)
             return
         if not S.TRADING_ENABLED:
-            await cb.answer(t("trade_disabled"), show_alert=True)
+            await cb.answer(t("trade_disabled", lang), show_alert=True)
             return
         
         # Calculate executable amount: min(route_volume, max_notional, account_balance)
@@ -255,17 +554,17 @@ async def main():
             ex.pnl_usd = pnl
             ex.finished_at = timezone.now()
             ex.details = {"orders": orders, "final_base": final_base}
-            await cb.answer(t("exec_done"))
+            await cb.answer(t("exec_done", lang))
             await cb.message.edit_text(
-                f"{t('exec_done')}\nP&L: ${pnl:,.2f}\nFinal base: {final_base:.4f}",
-                reply_markup=kb_route(route_id),
+                f"{t('exec_done', lang)}\nP&L: ${pnl:,.2f}\nFinal base: {final_base:.4f}",
+                reply_markup=kb_route(route_id, lang),
             )
         except Exception as e:
             ex.status = "failed"
             ex.details = {"error": str(e)}
             ex.finished_at = timezone.now()
-            await cb.answer(t("exec_failed"), show_alert=True)
-            await cb.message.edit_text(f"{t('exec_failed')}: {e}", reply_markup=kb_route(route_id))
+            await cb.answer(t("exec_failed", lang), show_alert=True)
+            await cb.message.edit_text(f"{t('exec_failed', lang)}: {e}", reply_markup=kb_route(route_id, lang))
         finally:
             await sync_to_async(ex.save)()
 

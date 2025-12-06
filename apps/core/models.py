@@ -11,6 +11,7 @@ class BotSettings(models.Model):
     min_notional_usd = models.FloatField(default=10)
     max_notional_usd = models.FloatField(default=10000)
     base_asset = models.CharField(max_length=16, default="USDT")
+    bot_language = models.CharField(max_length=8, default="en")
     updated_at = models.DateTimeField(auto_now=True)
 
     def __str__(self):

@@ -9,8 +9,19 @@ from .models import BotSettings, Route
 from .arbitrage import find_candidate_routes
 
 
-def _t(key: str) -> str:
+def _t(key: str, lang: str = None) -> str:
     """Translation helper for tasks (matches bot.py t() function)"""
+    if lang is None:
+        # Try to get from database
+        try:
+            cfg = BotSettings.objects.filter(id=1).first()
+            if cfg and cfg.bot_language:
+                lang = cfg.bot_language
+            else:
+                lang = S.BOT_LANGUAGE
+        except Exception:
+            lang = S.BOT_LANGUAGE
+    
     ru = {
         "check": "Проверить актуальность",
         "exec": "Исполнить сделку",
@@ -19,7 +30,7 @@ def _t(key: str) -> str:
         "check": "Check Validity",
         "exec": "Execute Trade",
     }
-    return ru.get(key) if S.BOT_LANGUAGE.lower().startswith("ru") else en.get(key)
+    return ru.get(key) if lang and lang.lower().startswith("ru") else en.get(key)
 
 
 @shared_task
@@ -35,6 +46,7 @@ def scan_triangular_routes():
             "min_notional_usd": S.MIN_NOTIONAL_USD,
             "max_notional_usd": S.MAX_NOTIONAL_USD,
             "base_asset": S.BASE_ASSET,
+            "bot_language": S.BOT_LANGUAGE,
         })
         if not cfg.scanning_enabled:
             return "disabled"
@@ -44,6 +56,7 @@ def scan_triangular_routes():
             max_profit_pct=cfg.max_profit_pct,
         )
         created = 0
+        lang = cfg.bot_language if cfg.bot_language else S.BOT_LANGUAGE
         with transaction.atomic():
             for c in candidates:
                 r = Route.objects.create(
@@ -58,8 +71,8 @@ def scan_triangular_routes():
                 try:
                     kb = {
                         "inline_keyboard": [
-                            [{"text": _t("check"), "callback_data": f"check:{r.id}"}],
-                            [{"text": _t("exec"), "callback_data": f"exec:{r.id}"}],
+                            [{"text": _t("check", lang), "callback_data": f"check:{r.id}"}],
+                            [{"text": _t("exec", lang), "callback_data": f"exec:{r.id}"}],
                         ]
                     }
                     text = f"Route: {r.leg_a} → {r.leg_b} → {r.leg_c}\nProfit: {r.profit_pct:.2f}%\nVolume: ${r.volume_usd:,.0f}"
