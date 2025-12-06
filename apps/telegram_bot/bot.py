@@ -20,7 +20,7 @@ from django.utils import timezone
 from arbbot import settings as S
 from apps.core.models import BotSettings, Route, Execution
 from apps.core.arbitrage import CandidateRoute, revalidate_route
-from apps.core.trading import execute_cycle
+from apps.core.trading import execute_cycle, get_account_balance
 from asgiref.sync import sync_to_async
 from apps.core.tasks import scan_triangular_routes
 
@@ -191,12 +191,22 @@ async def main():
         if not new_cand:
             await cb.answer(t("not_valid"), show_alert=True)
             return
-        notional = min(new_cand.volume_usd, S.MAX_NOTIONAL_USD)
+        
+        # Calculate executable amount: min(route_volume, max_notional, account_balance)
+        try:
+            balances = await sync_to_async(get_account_balance)(S.BASE_ASSET.upper())
+            available_balance = balances.get(S.BASE_ASSET.upper(), 0.0)
+        except Exception:
+            available_balance = S.MAX_NOTIONAL_USD  # Fallback if balance check fails
+        
+        notional = min(new_cand.volume_usd, S.MAX_NOTIONAL_USD, available_balance)
+        
         text = (
             f"{t('confirm_title')}\n"
             f"Route: {new_cand.a} → {new_cand.b} → {new_cand.c}\n"
             f"Profit: {new_cand.profit_pct:.2f}%\n"
-            f"Planned notional: ${notional:,.0f}"
+            f"Available balance: ${available_balance:,.2f}\n"
+            f"Planned notional: ${notional:,.2f}"
         )
         await cb.message.edit_text(text, reply_markup=kb_confirm(route_id))
         await cb.answer(t("exec_started"))
@@ -221,7 +231,22 @@ async def main():
         if not S.TRADING_ENABLED:
             await cb.answer(t("trade_disabled"), show_alert=True)
             return
-        notional = min(new_cand.volume_usd, S.MAX_NOTIONAL_USD)
+        
+        # Calculate executable amount: min(route_volume, max_notional, account_balance)
+        # Re-check balance right before execution (balance may have changed)
+        try:
+            balances = await sync_to_async(get_account_balance)(S.BASE_ASSET.upper())
+            available_balance = balances.get(S.BASE_ASSET.upper(), 0.0)
+        except Exception as e:
+            await cb.answer(f"Balance check failed: {e}", show_alert=True)
+            return
+        
+        notional = min(new_cand.volume_usd, S.MAX_NOTIONAL_USD, available_balance)
+        
+        if notional < S.MIN_NOTIONAL_USD:
+            await cb.answer(f"Insufficient balance. Need ${S.MIN_NOTIONAL_USD:.2f}, have ${available_balance:.2f}", show_alert=True)
+            return
+        
         ex = await sync_to_async(Execution.objects.create)(route=r, status="running", notional_usd=notional)
         try:
             final_base, orders = await sync_to_async(execute_cycle)(new_cand, notional)

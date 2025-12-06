@@ -9,6 +9,19 @@ from .models import BotSettings, Route
 from .arbitrage import find_candidate_routes
 
 
+def _t(key: str) -> str:
+    """Translation helper for tasks (matches bot.py t() function)"""
+    ru = {
+        "check": "Проверить актуальность",
+        "exec": "Исполнить сделку",
+    }
+    en = {
+        "check": "Check Validity",
+        "exec": "Execute Trade",
+    }
+    return ru.get(key) if S.BOT_LANGUAGE.lower().startswith("ru") else en.get(key)
+
+
 @shared_task
 def scan_triangular_routes():
     try:
@@ -45,8 +58,8 @@ def scan_triangular_routes():
                 try:
                     kb = {
                         "inline_keyboard": [
-                            [{"text": "Check Validity", "callback_data": f"check:{r.id}"}],
-                            [{"text": "Execute Trade", "callback_data": f"exec:{r.id}"}],
+                            [{"text": _t("check"), "callback_data": f"check:{r.id}"}],
+                            [{"text": _t("exec"), "callback_data": f"exec:{r.id}"}],
                         ]
                     }
                     text = f"Route: {r.leg_a} → {r.leg_b} → {r.leg_c}\nProfit: {r.profit_pct:.2f}%\nVolume: ${r.volume_usd:,.0f}"

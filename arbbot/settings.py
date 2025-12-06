@@ -85,6 +85,11 @@ USE_TZ = True
 STATIC_URL = "static/"
 DEFAULT_AUTO_FIELD = "django.db.models.BigAutoField"
 
+# Networking options for Binance connector
+BINANCE_BASE_URL = os.getenv("BINANCE_BASE_URL", "https://api.binance.com")
+# Example: PROXY_URL=http://127.0.0.1:7890 or socks5://127.0.0.1:1080
+PROXY_URL = os.getenv("PROXY_URL", "")
+
 # Celery/Redis
 REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379/0")
 CELERY_BROKER_URL = REDIS_URL

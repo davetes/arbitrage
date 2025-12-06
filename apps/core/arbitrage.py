@@ -2,6 +2,7 @@ from dataclasses import dataclass
 from typing import List, Optional, Dict, Tuple
 from binance.spot import Spot as BinanceClient
 from arbbot import settings as S
+import time
 
 
 @dataclass
@@ -15,40 +16,64 @@ class CandidateRoute:
 
 def _client() -> BinanceClient:
     # Public endpoints are sufficient for order books; keys optional
+    # Add timeout to prevent hanging on network issues
+    timeout = 15  # increase timeout to reduce ReadTimeouts
+    kwargs = {
+        "timeout": timeout,
+        "base_url": getattr(S, "BINANCE_BASE_URL", "https://api.binance.com"),
+    }
+    proxy_url = getattr(S, "PROXY_URL", "")
+    if proxy_url:
+        kwargs["proxies"] = {"http": proxy_url, "https": proxy_url}
     if S.BINANCE_API_KEY and S.BINANCE_API_SECRET:
-        return BinanceClient(api_key=S.BINANCE_API_KEY, api_secret=S.BINANCE_API_SECRET)
-    return BinanceClient()
+        return BinanceClient(api_key=S.BINANCE_API_KEY, api_secret=S.BINANCE_API_SECRET, **kwargs)
+    return BinanceClient(**kwargs)
 
 
 def _load_symbols(client: BinanceClient) -> Dict[str, dict]:
-    info = client.exchange_info()
-    return {s["symbol"]: s for s in info.get("symbols", []) if s.get("status") == "TRADING"}
+    # retry exchange_info a few times on transient errors/timeouts
+    backoff = 0.5
+    last_err: Optional[Exception] = None
+    for _ in range(3):
+        try:
+            info = client.exchange_info()
+            return {s["symbol"]: s for s in info.get("symbols", []) if s.get("status") == "TRADING"}
+        except Exception as e:
+            last_err = e
+            time.sleep(backoff)
+            backoff *= 2
+    # If still failing, bubble up the last error to be caught by caller
+    raise last_err  # type: ignore[misc]
 
 
 def _depth_snapshot(client: BinanceClient, symbol: str, depth: int = 20) -> Optional[dict]:
-    # returns dict with best prices and cumulative depth
-    try:
-        d = client.depth(symbol, limit=depth)
-        if not d.get("asks") or not d.get("bids"):
-            return None
-        ask_p, ask_q = float(d["asks"][0][0]), float(d["asks"][0][1])
-        bid_p, bid_q = float(d["bids"][0][0]), float(d["bids"][0][1])
-        total_ask_qty = sum(float(q) for _, q in d["asks"])
-        total_bid_qty = sum(float(q) for _, q in d["bids"])
-        cap_ask_quote = sum(float(p) * float(q) for p, q in d["asks"])
-        cap_bid_quote = sum(float(p) * float(q) for p, q in d["bids"])
-        return {
-            "ask_price": ask_p,
-            "ask_qty": ask_q,
-            "bid_price": bid_p,
-            "bid_qty": bid_q,
-            "total_ask_qty": total_ask_qty,
-            "total_bid_qty": total_bid_qty,
-            "cap_ask_quote": cap_ask_quote,
-            "cap_bid_quote": cap_bid_quote,
-        }
-    except Exception:
-        return None
+    # returns dict with best prices and cumulative depth, with retries
+    backoff = 0.25
+    for _ in range(3):
+        try:
+            d = client.depth(symbol, limit=depth)
+            if not d.get("asks") or not d.get("bids"):
+                return None
+            ask_p, ask_q = float(d["asks"][0][0]), float(d["asks"][0][1])
+            bid_p, bid_q = float(d["bids"][0][0]), float(d["bids"][0][1])
+            total_ask_qty = sum(float(q) for _, q in d["asks"])
+            total_bid_qty = sum(float(q) for _, q in d["bids"])
+            cap_ask_quote = sum(float(p) * float(q) for p, q in d["asks"])
+            cap_bid_quote = sum(float(p) * float(q) for p, q in d["bids"])
+            return {
+                "ask_price": ask_p,
+                "ask_qty": ask_q,
+                "bid_price": bid_p,
+                "bid_qty": bid_q,
+                "total_ask_qty": total_ask_qty,
+                "total_bid_qty": total_bid_qty,
+                "cap_ask_quote": cap_ask_quote,
+                "cap_bid_quote": cap_bid_quote,
+            }
+        except Exception:
+            time.sleep(backoff)
+            backoff *= 2
+    return None
 
 
 def _try_triangle(client: BinanceClient, symbols: Dict[str, dict], base: str, x: str, y: str) -> Optional[CandidateRoute]:
@@ -165,9 +190,15 @@ def find_candidate_routes(*, min_profit_pct: float, max_profit_pct: float) -> Li
         client = _client()
         symbols = _load_symbols(client)
         base = S.BASE_ASSET.upper()
-        # Limit universe for now; can expand later or fetch top volumes
-        universe = ["BTC", "ETH", "BNB", "SXP", "CHZ", "BICO", "LISTA"]
+        # Expanded universe of popular trading pairs with good liquidity
+        universe = [
+            "BTC", "ETH", "BNB", "SOL", "ADA", "XRP", "DOGE", "MATIC", 
+            "AVAX", "DOT", "LINK", "UNI", "ATOM", "LTC", "ETC", "XLM",
+            "ALGO", "VET", "FIL", "TRX", "EOS", "AAVE", "SXP", "CHZ",
+            "BICO", "LISTA", "APT", "ARB", "OP", "SUI", "SEI", "TIA"
+        ]
         cand: List[CandidateRoute] = []
+        routes_found_before_filter = 0
         for i, x in enumerate(universe):
             if x == base:
                 continue
@@ -176,13 +207,16 @@ def find_candidate_routes(*, min_profit_pct: float, max_profit_pct: float) -> Li
                     continue
                 r = _try_triangle(client, symbols, base, x, y)
                 if r:
+                    routes_found_before_filter += 1
                     # Clamp to provided thresholds at call-site too
                     if r.profit_pct >= min_profit_pct and r.profit_pct <= max_profit_pct:
                         cand.append(r)
         # Sort by profit desc and return a few
         cand.sort(key=lambda z: z.profit_pct, reverse=True)
         return cand[:5]
-    except Exception:
+    except Exception as e:
+        import logging
+        logging.error(f"Error in find_candidate_routes: {e}", exc_info=True)
         return []
 
 

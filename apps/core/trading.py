@@ -13,6 +13,23 @@ def _client_auth() -> BinanceClient:
     return BinanceClient(api_key=S.BINANCE_API_KEY, api_secret=S.BINANCE_API_SECRET)
 
 
+def get_account_balance(asset: str = None) -> Dict[str, float]:
+    """
+    Get account balances. If asset is specified, returns balance for that asset only.
+    Returns dict of {asset: free_balance}
+    """
+    client = _client_auth()
+    account = client.account()
+    balances = {}
+    for bal in account.get("balances", []):
+        free = float(bal.get("free", 0))
+        if free > 0:
+            balances[bal["asset"]] = free
+    if asset:
+        return {asset: balances.get(asset.upper(), 0.0)}
+    return balances
+
+
 def _symbol_filters(symbol_info: dict) -> Tuple[float, float]:
     price_filter = next((f for f in symbol_info.get("filters", []) if f["filterType"] == "PRICE_FILTER"), None)
     lot_filter = next((f for f in symbol_info.get("filters", []) if f["filterType"] == "LOT_SIZE"), None)
@@ -80,3 +97,5 @@ def execute_cycle(route: CandidateRoute, notional_usd: float) -> Tuple[float, Li
         orders.append(order)
 
     return current_amount, orders
+
+
