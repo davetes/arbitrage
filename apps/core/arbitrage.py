@@ -130,6 +130,209 @@ def _fetch_depth_parallel(client: BinanceClient, symbols: List[str], max_workers
     return results
 
 
+def _try_triangle_generic(
+    client: BinanceClient,
+    symbols: Dict[str, dict],
+    x: str,
+    y: str,
+    z: str,
+    min_profit_pct: float = None,
+    max_profit_pct: float = None,
+    depth_cache: Dict[str, Optional[dict]] = None,
+    available_balance: float = None
+) -> Optional[CandidateRoute]:
+    """
+    Try to find a triangular arbitrage route: x -> y -> z -> x
+    Works with any three assets, not just base asset.
+    """
+    # Pairs for leg 1: x -> y (can be XY or YX)
+    pair1_xy = f"{x}{y}"
+    pair1_yx = f"{y}{x}"
+    # Pairs for leg 2: y -> z (can be YZ or ZY)
+    pair2_yz = f"{y}{z}"
+    pair2_zy = f"{z}{y}"
+    # Pairs for leg 3: z -> x (can be ZX or XZ)
+    pair3_zx = f"{z}{x}"
+    pair3_xz = f"{x}{z}"
+
+    # Helper to get depth from cache or fetch
+    def get_depth(symbol: str) -> Optional[dict]:
+        if depth_cache is not None:
+            return depth_cache.get(symbol)
+        return _depth_snapshot(client, symbol, use_cache=True)
+    
+    # Leg 1: Convert X to Y
+    leg1_label = None
+    x_to_y = None
+    cap1_x = None  # Capacity in X units
+    
+    if pair1_xy in symbols:
+        d1 = get_depth(pair1_xy)
+        if not d1:
+            return None
+        p1_ask, q1_ask = d1["ask_price"], d1["ask_qty"]
+        # Buy Y with X: 1 unit X buys 1/p1_ask units of Y
+        x_to_y = 1.0 / p1_ask
+        # cap_ask_quote is in X (quote currency) terms
+        cap1_x = d1["cap_ask_quote"]
+        leg1_label = f"{y}/{x} buy"
+    elif pair1_yx in symbols:
+        d1 = get_depth(pair1_yx)
+        if not d1:
+            return None
+        p1_bid, q1_bid = d1["bid_price"], d1["bid_qty"]
+        # Sell X to get Y: 1 unit X sells for p1_bid units of Y
+        x_to_y = p1_bid
+        # cap_bid_quote is in X (quote currency) terms
+        cap1_x = d1["cap_bid_quote"]
+        leg1_label = f"{x}/{y} sell"
+    else:
+        return None
+
+    # Leg 2: Convert Y to Z
+    leg2_label = None
+    y_to_z = None
+    cap2_y = None  # Capacity in Y units
+    
+    if pair2_yz in symbols:
+        d2 = get_depth(pair2_yz)
+        if not d2:
+            return None
+        p2_ask, q2_ask = d2["ask_price"], d2["ask_qty"]
+        # Buy Z with Y: 1 unit Y buys 1/p2_ask units of Z
+        y_to_z = 1.0 / p2_ask
+        # cap_ask_quote is in Y (quote currency) terms
+        cap2_y = d2["cap_ask_quote"]
+        leg2_label = f"{z}/{y} buy"
+    elif pair2_zy in symbols:
+        d2 = get_depth(pair2_zy)
+        if not d2:
+            return None
+        p2_bid, q2_bid = d2["bid_price"], d2["bid_qty"]
+        # Sell Y to get Z: 1 unit Y sells for p2_bid units of Z
+        y_to_z = p2_bid
+        # cap_bid_quote is in Y (quote currency) terms
+        cap2_y = d2["cap_bid_quote"]
+        leg2_label = f"{y}/{z} sell"
+    else:
+        return None
+
+    # Leg 3: Convert Z back to X
+    leg3_label = None
+    z_to_x = None
+    cap3_z = None  # Capacity in Z units
+    
+    if pair3_zx in symbols:
+        d3 = get_depth(pair3_zx)
+        if not d3:
+            return None
+        p3_ask, q3_ask = d3["ask_price"], d3["ask_qty"]
+        # Buy X with Z: 1 unit Z buys 1/p3_ask units of X
+        z_to_x = 1.0 / p3_ask
+        # cap_ask_quote is in Z (quote currency) terms
+        cap3_z = d3["cap_ask_quote"]
+        leg3_label = f"{x}/{z} buy"
+    elif pair3_xz in symbols:
+        d3 = get_depth(pair3_xz)
+        if not d3:
+            return None
+        p3_bid, q3_bid = d3["bid_price"], d3["bid_qty"]
+        # Sell Z to get X: 1 unit Z sells for p3_bid units of X
+        z_to_x = p3_bid
+        # cap_bid_quote is in Z (quote currency) terms
+        cap3_z = d3["cap_bid_quote"]
+        leg3_label = f"{z}/{x} sell"
+    else:
+        return None
+
+    # Apply fees (bps to fraction)
+    fee = (S.FEE_RATE_BPS + S.EXTRA_FEE_BPS) / 10000.0
+    eff1 = x_to_y * (1 - fee)
+    eff2 = y_to_z * (1 - fee)
+    eff3 = z_to_x * (1 - fee)
+
+    # Net multiplier for 1 unit of X
+    net = eff1 * eff2 * eff3
+    profit_pct = (net - 1.0) * 100.0
+
+    # Use passed parameters or fallback to settings
+    min_prof = min_profit_pct if min_profit_pct is not None else S.MIN_PROFIT_PCT
+    max_prof = max_profit_pct if max_profit_pct is not None else S.MAX_PROFIT_PCT
+    
+    # Log filtered routes for debugging (only log a sample to avoid spam)
+    if profit_pct < min_prof or profit_pct > max_prof:
+        # Log occasionally to help diagnose threshold issues
+        if random.random() < 0.01:  # Log 1% of filtered routes
+            logger.debug(f"Route filtered: {x}-{y}-{z} profit={profit_pct:.4f}% (range: {min_prof}%-{max_prof}%)")
+        return None
+
+    # Capacity estimation - convert all to X terms
+    # cap1_x is already in X (or needs conversion if it was in quote terms)
+    # For XY pair: cap1_x is in X terms (quote currency)
+    # For YX pair: cap1_x is in X terms (base currency)
+    
+    # cap2_y needs to be converted to X: cap2_y / x_to_y
+    cap2_x = cap2_y / x_to_y if x_to_y > 0 else 0
+    # cap3_z needs to be converted to X: cap3_z / (x_to_y * y_to_z)
+    if x_to_y > 0 and y_to_z > 0:
+        cap3_x = cap3_z / (x_to_y * y_to_z)
+    else:
+        cap3_x = 0
+    
+    # Determine max X notional (in X units)
+    max_x_units = max(0.0, min(cap1_x, cap2_x, cap3_x))
+    
+    # Convert X units to USD using base asset pair
+    base = S.BASE_ASSET.upper()
+    max_volume_usd = None
+    
+    # Try to find X/BASE or BASE/X pair to convert to USD
+    x_base_pair = f"{x}{base}"
+    base_x_pair = f"{base}{x}"
+    
+    if x_base_pair in symbols:
+        d_x = get_depth(x_base_pair)
+        if d_x:
+            # X/BASE pair: price is in BASE per X
+            # max_x_units of X = max_x_units * price in BASE
+            price_x = d_x["bid_price"]  # Use bid for conservative estimate
+            max_volume_usd = max_x_units * price_x
+    elif base_x_pair in symbols:
+        d_x = get_depth(base_x_pair)
+        if d_x:
+            # BASE/X pair: price is in X per BASE
+            # max_x_units of X = max_x_units / price in X
+            price_x = d_x["ask_price"]  # Use ask for conservative estimate
+            if price_x > 0:
+                max_volume_usd = max_x_units / price_x
+    
+    # If we can't convert to USD, skip this route (or use a fallback)
+    if max_volume_usd is None or max_volume_usd <= 0:
+        # Try using available_balance as fallback if provided
+        if available_balance is not None and available_balance > 0:
+            max_volume_usd = min(available_balance, S.MAX_NOTIONAL_USD)
+        else:
+            # Skip routes we can't price in USD
+            return None
+    
+    # Apply limits
+    if available_balance is not None and available_balance > 0:
+        max_volume_usd = min(available_balance, max_volume_usd, S.MAX_NOTIONAL_USD)
+    else:
+        max_volume_usd = min(max_volume_usd, S.MAX_NOTIONAL_USD)
+    
+    if max_volume_usd < S.MIN_NOTIONAL_USD:
+        return None
+
+    return CandidateRoute(
+        a=leg1_label,
+        b=leg2_label,
+        c=leg3_label,
+        profit_pct=round(profit_pct, 4),
+        volume_usd=round(max_volume_usd, 2),
+    )
+
+
 def _try_triangle(
     client: BinanceClient, 
     symbols: Dict[str, dict], 
@@ -299,7 +502,6 @@ def find_candidate_routes(
         stats["symbols_loaded"] = len(symbols)
         logger.info(f"Loaded {len(symbols)} symbols, filtering for profit: {min_profit_pct}% - {max_profit_pct}%")
         
-        base = S.BASE_ASSET.upper()
         # Expanded universe of popular trading pairs with good liquidity
         universe = [
             "BTC", "ETH", "BNB", "SOL", "ADA", "XRP", "DOGE", "MATIC", 
@@ -308,25 +510,25 @@ def find_candidate_routes(
             "BICO", "LISTA", "APT", "ARB", "OP", "SUI", "SEI", "TIA"
         ]
         
-        # Step 1: Collect all unique symbols needed for triangles
+        # Step 1: Collect all unique symbols needed for ALL triangles (not just base-asset triangles)
         needed_symbols = set()
+        # For each combination of 3 assets (x, y, z), we need pairs: XY/YX, YZ/ZY, ZX/XZ
         for i, x in enumerate(universe):
-            if x == base:
-                continue
-            for y in universe[i + 1:]:
-                if y == base or y == x:
-                    continue
-                # Add all possible pair combinations
-                needed_symbols.add(f"{x}{base}")
-                needed_symbols.add(f"{base}{x}")
-                needed_symbols.add(f"{x}{y}")
-                needed_symbols.add(f"{y}{x}")
-                needed_symbols.add(f"{y}{base}")
-                needed_symbols.add(f"{base}{y}")
+            for j, y in enumerate(universe[i + 1:], start=i + 1):
+                for z in universe[j + 1:]:
+                    if x == y or y == z or x == z:
+                        continue
+                    # Add all possible pair combinations for triangle x->y->z->x
+                    needed_symbols.add(f"{x}{y}")
+                    needed_symbols.add(f"{y}{x}")
+                    needed_symbols.add(f"{y}{z}")
+                    needed_symbols.add(f"{z}{y}")
+                    needed_symbols.add(f"{z}{x}")
+                    needed_symbols.add(f"{x}{z}")
         
         # Filter to only symbols that exist
         existing_symbols = [s for s in needed_symbols if s in symbols]
-        logger.info(f"Pre-fetching depths for {len(existing_symbols)} unique symbols...")
+        logger.info(f"Pre-fetching depths for {len(existing_symbols)} unique symbols (all triangles)...")
         
         # Step 2: Fetch all depths in parallel
         start_fetch = time.time()
@@ -337,26 +539,25 @@ def find_candidate_routes(
         stats["fetch_time"] = fetch_time
         logger.info(f"Fetched {fetched_count}/{len(existing_symbols)} depths in {fetch_time:.2f}s (parallel)")
         
-        # Step 3: Check triangles using cached depths
+        # Step 3: Check ALL triangles using cached depths (x -> y -> z -> x for any x, y, z)
         cand: List[CandidateRoute] = []
         checked = 0
         start_triangles = time.time()
         for i, x in enumerate(universe):
-            if x == base:
-                continue
-            for y in universe[i + 1:]:
-                if y == base or y == x:
-                    continue
-                checked += 1
-                r = _try_triangle(
-                    client, symbols, base, x, y, 
-                    min_profit_pct, max_profit_pct, 
-                    depth_cache=depth_cache,
-                    available_balance=available_balance
-                )
-                if r:
-                    logger.debug(f"Found route: {r.a} → {r.b} → {r.c}, profit: {r.profit_pct}%, volume: ${r.volume_usd}")
-                    cand.append(r)
+            for j, y in enumerate(universe[i + 1:], start=i + 1):
+                for z in universe[j + 1:]:
+                    if x == y or y == z or x == z:
+                        continue
+                    checked += 1
+                    r = _try_triangle_generic(
+                        client, symbols, x, y, z,
+                        min_profit_pct, max_profit_pct,
+                        depth_cache=depth_cache,
+                        available_balance=available_balance
+                    )
+                    if r:
+                        logger.debug(f"Found route: {r.a} → {r.b} → {r.c}, profit: {r.profit_pct}%, volume: ${r.volume_usd}")
+                        cand.append(r)
         
         triangle_time = time.time() - start_triangles
         stats["triangles_checked"] = checked
