@@ -4,6 +4,39 @@ from binance.spot import Spot as BinanceClient
 from arbbot import settings as S
 from .symbol_loader import get_symbol_loader
 import time
+import logging
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
+logger = logging.getLogger(__name__)
+
+
+class DepthCache:
+    """Cache for order book depth snapshots with TTL"""
+    def __init__(self, ttl_seconds: float = 2.0):
+        self.ttl = ttl_seconds
+        self._cache: Dict[str, Tuple[dict, float]] = {}
+    
+    def get(self, symbol: str) -> Optional[dict]:
+        """Get cached depth if still valid"""
+        if symbol in self._cache:
+            data, timestamp = self._cache[symbol]
+            if time.time() - timestamp < self.ttl:
+                return data
+            else:
+                del self._cache[symbol]
+        return None
+    
+    def set(self, symbol: str, data: dict):
+        """Cache depth data"""
+        self._cache[symbol] = (data, time.time())
+    
+    def clear(self):
+        """Clear all cached data"""
+        self._cache.clear()
+
+
+# Global depth cache instance (2 second TTL)
+_depth_cache = DepthCache(ttl_seconds=2.0)
 
 
 @dataclass
@@ -39,8 +72,15 @@ def _load_symbols(client: BinanceClient) -> Dict[str, dict]:
     return loader.load_symbols(client, base_asset=S.BASE_ASSET, use_cache=True)
 
 
-def _depth_snapshot(client: BinanceClient, symbol: str, depth: int = 20) -> Optional[dict]:
-    # returns dict with best prices and cumulative depth, with retries
+def _depth_snapshot(client: BinanceClient, symbol: str, depth: int = 20, use_cache: bool = True) -> Optional[dict]:
+    """Get depth snapshot with caching and retries"""
+    # Check cache first
+    if use_cache:
+        cached = _depth_cache.get(symbol)
+        if cached is not None:
+            return cached
+    
+    # Fetch from API with retries
     backoff = 0.25
     for _ in range(3):
         try:
@@ -53,7 +93,7 @@ def _depth_snapshot(client: BinanceClient, symbol: str, depth: int = 20) -> Opti
             total_bid_qty = sum(float(q) for _, q in d["bids"])
             cap_ask_quote = sum(float(p) * float(q) for p, q in d["asks"])
             cap_bid_quote = sum(float(p) * float(q) for p, q in d["bids"])
-            return {
+            result = {
                 "ask_price": ask_p,
                 "ask_qty": ask_q,
                 "bid_price": bid_p,
@@ -63,10 +103,30 @@ def _depth_snapshot(client: BinanceClient, symbol: str, depth: int = 20) -> Opti
                 "cap_ask_quote": cap_ask_quote,
                 "cap_bid_quote": cap_bid_quote,
             }
+            # Cache the result
+            if use_cache:
+                _depth_cache.set(symbol, result)
+            return result
         except Exception:
             time.sleep(backoff)
             backoff *= 2
     return None
+
+
+def _fetch_depth_parallel(client: BinanceClient, symbols: List[str], max_workers: int = 10) -> Dict[str, Optional[dict]]:
+    """Fetch multiple depth snapshots in parallel"""
+    results = {}
+    
+    def fetch_one(symbol: str):
+        return symbol, _depth_snapshot(client, symbol, use_cache=True)
+    
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        future_to_symbol = {executor.submit(fetch_one, sym): sym for sym in symbols}
+        for future in as_completed(future_to_symbol):
+            symbol, depth = future.result()
+            results[symbol] = depth
+    
+    return results
 
 
 def _try_triangle(
@@ -76,7 +136,8 @@ def _try_triangle(
     x: str, 
     y: str,
     min_profit_pct: float = None,
-    max_profit_pct: float = None
+    max_profit_pct: float = None,
+    depth_cache: Dict[str, Optional[dict]] = None
 ) -> Optional[CandidateRoute]:
     # Route: base -> x -> y -> base using available direction per symbol existence
     # Pairs considered: XBASE, XY or YX, YBASE
@@ -87,10 +148,16 @@ def _try_triangle(
     pair3 = f"{y}{base}"
     pair3_inv = f"{base}{y}"
 
+    # Helper to get depth from cache or fetch
+    def get_depth(symbol: str) -> Optional[dict]:
+        if depth_cache is not None:
+            return depth_cache.get(symbol)
+        return _depth_snapshot(client, symbol, use_cache=True)
+    
     # Leg 1: buy X with BASE (prefer XBASE ask); if only BASEX exists, sell BASE for X via BASEX bid
     leg1_label = None
     if pair1 in symbols:
-        d1 = _depth_snapshot(client, pair1)
+        d1 = get_depth(pair1)
         if not d1:
             return None
         p1_ask, q1_ask = d1["ask_price"], d1["ask_qty"]
@@ -99,7 +166,7 @@ def _try_triangle(
         cap1_usd = d1["cap_ask_quote"]  # quote notional depth
         leg1_label = f"{x}/{base} buy"
     elif pair1_inv in symbols:
-        d1 = _depth_snapshot(client, pair1_inv)
+        d1 = get_depth(pair1_inv)
         if not d1:
             return None
         p1_bid, q1_bid = d1["bid_price"], d1["bid_qty"]
@@ -112,7 +179,7 @@ def _try_triangle(
 
     # Leg 2: convert X to Y using XY or YX
     if pair2_xy in symbols:
-        d2 = _depth_snapshot(client, pair2_xy)
+        d2 = get_depth(pair2_xy)
         if not d2:
             return None
         p2_bid, q2_bid = d2["bid_price"], d2["bid_qty"]
@@ -122,7 +189,7 @@ def _try_triangle(
         cap2_x = d2["total_bid_qty"]
         leg2_label = f"{y}/{x} buy"  # equivalent of selling X for Y on XY
     elif pair2_yx in symbols:
-        d2 = _depth_snapshot(client, pair2_yx)
+        d2 = get_depth(pair2_yx)
         if not d2:
             return None
         p2_ask, q2_ask = d2["ask_price"], d2["ask_qty"]
@@ -135,7 +202,7 @@ def _try_triangle(
 
     # Leg 3: convert Y to BASE
     if pair3 in symbols:
-        d3 = _depth_snapshot(client, pair3)
+        d3 = get_depth(pair3)
         if not d3:
             return None
         p3_bid, q3_bid = d3["bid_price"], d3["bid_qty"]
@@ -143,7 +210,7 @@ def _try_triangle(
         cap3_y = d3["total_bid_qty"]
         leg3_label = f"{y}/{base} sell"
     elif pair3_inv in symbols:
-        d3 = _depth_snapshot(client, pair3_inv)
+        d3 = get_depth(pair3_inv)
         if not d3:
             return None
         p3_ask, q3_ask = d3["ask_price"], d3["ask_qty"]
@@ -207,19 +274,52 @@ def find_candidate_routes(*, min_profit_pct: float, max_profit_pct: float) -> Li
             "ALGO", "VET", "FIL", "TRX", "EOS", "AAVE", "SXP", "CHZ",
             "BICO", "LISTA", "APT", "ARB", "OP", "SUI", "SEI", "TIA"
         ]
-        cand: List[CandidateRoute] = []
-        checked = 0
+        
+        # Step 1: Collect all unique symbols needed for triangles
+        needed_symbols = set()
         for i, x in enumerate(universe):
             if x == base:
                 continue
-            for y in universe[i + 1 :]:
+            for y in universe[i + 1:]:
+                if y == base or y == x:
+                    continue
+                # Add all possible pair combinations
+                needed_symbols.add(f"{x}{base}")
+                needed_symbols.add(f"{base}{x}")
+                needed_symbols.add(f"{x}{y}")
+                needed_symbols.add(f"{y}{x}")
+                needed_symbols.add(f"{y}{base}")
+                needed_symbols.add(f"{base}{y}")
+        
+        # Filter to only symbols that exist
+        existing_symbols = [s for s in needed_symbols if s in symbols]
+        logger.info(f"Pre-fetching depths for {len(existing_symbols)} unique symbols...")
+        
+        # Step 2: Fetch all depths in parallel
+        start_fetch = time.time()
+        depth_cache = _fetch_depth_parallel(client, existing_symbols, max_workers=20)
+        fetch_time = time.time() - start_fetch
+        fetched_count = sum(1 for v in depth_cache.values() if v is not None)
+        logger.info(f"Fetched {fetched_count}/{len(existing_symbols)} depths in {fetch_time:.2f}s (parallel)")
+        
+        # Step 3: Check triangles using cached depths
+        cand: List[CandidateRoute] = []
+        checked = 0
+        start_triangles = time.time()
+        for i, x in enumerate(universe):
+            if x == base:
+                continue
+            for y in universe[i + 1:]:
                 if y == base or y == x:
                     continue
                 checked += 1
-                r = _try_triangle(client, symbols, base, x, y, min_profit_pct, max_profit_pct)
+                r = _try_triangle(client, symbols, base, x, y, min_profit_pct, max_profit_pct, depth_cache=depth_cache)
                 if r:
                     logger.debug(f"Found route: {r.a} → {r.b} → {r.c}, profit: {r.profit_pct}%, volume: ${r.volume_usd}")
                     cand.append(r)
+        
+        triangle_time = time.time() - start_triangles
+        logger.info(f"Checked {checked} triangles in {triangle_time:.2f}s ({triangle_time/checked*1000:.1f}ms per triangle)")
         
         logger.info(f"Checked {checked} triangle combinations, found {len(cand)} profitable routes")
         # Sort by profit desc and return a few
