@@ -420,7 +420,7 @@ async def main():
             await cb.answer(t("not_valid", lang), show_alert=True)
         else:
             logging.info(f"Route {route_id} revalidated: profit={new_cand.profit_pct}% volume=${new_cand.volume_usd}")
-            text = f"Route:\n{new_cand.a}\n{new_cand.b}\n{new_cand.c}\n\nProfit: {new_cand.profit_pct:.2f}%\nVolume: ${new_cand.volume_usd:,.0f}"
+            text = f"Route: {new_cand.a} → {new_cand.b} → {new_cand.c}\nProfit: {new_cand.profit_pct:.2f}%\nVolume: ${new_cand.volume_usd:,.0f}"
             await cb.message.edit_text(text, reply_markup=kb_route(route_id, lang))
             await cb.answer(t("revalidated", lang))
 
@@ -461,7 +461,7 @@ async def main():
         
         text = (
             f"{t('confirm_title', lang)}\n"
-            f"Route:\n{new_cand.a}\n{new_cand.b}\n{new_cand.c}\n\n"
+            f"Route: {new_cand.a} → {new_cand.b} → {new_cand.c}\n"
             f"Profit: {new_cand.profit_pct:.2f}%\n"
             f"Available balance: ${available_balance:,.2f}\n"
             f"Mode: {balance_mode}\n"
