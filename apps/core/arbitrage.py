@@ -137,7 +137,8 @@ def _try_triangle(
     y: str,
     min_profit_pct: float = None,
     max_profit_pct: float = None,
-    depth_cache: Dict[str, Optional[dict]] = None
+    depth_cache: Dict[str, Optional[dict]] = None,
+    available_balance: float = None
 ) -> Optional[CandidateRoute]:
     # Route: base -> x -> y -> base using available direction per symbol existence
     # Pairs considered: XBASE, XY or YX, YBASE
@@ -244,7 +245,15 @@ def _try_triangle(
     # Leg3 cap in BASE: cap3_y converted to BASE via y_to_base
     cap2_base = (cap2_x * x_to_y) * y_to_base  # X->Y at mid leg 2 then to BASE at leg3
     cap3_base = cap3_y * y_to_base
-    max_base = max(0.0, min(cap1_usd, cap2_base, cap3_base, S.MAX_NOTIONAL_USD))
+    
+    # If available_balance is provided, use it as the target (but still respect market capacity)
+    if available_balance is not None and available_balance > 0:
+        # Use available balance, but cap at market capacity and MAX_NOTIONAL_USD
+        max_base = min(available_balance, cap1_usd, cap2_base, cap3_base, S.MAX_NOTIONAL_USD)
+    else:
+        # Original logic: use market capacity
+        max_base = max(0.0, min(cap1_usd, cap2_base, cap3_base, S.MAX_NOTIONAL_USD))
+    
     if max_base < S.MIN_NOTIONAL_USD:
         return None
 
@@ -257,7 +266,12 @@ def _try_triangle(
     )
 
 
-def find_candidate_routes(*, min_profit_pct: float, max_profit_pct: float) -> List[CandidateRoute]:
+def find_candidate_routes(
+    *, 
+    min_profit_pct: float, 
+    max_profit_pct: float,
+    available_balance: float = None
+) -> List[CandidateRoute]:
     import logging
     logger = logging.getLogger(__name__)
     
@@ -313,7 +327,12 @@ def find_candidate_routes(*, min_profit_pct: float, max_profit_pct: float) -> Li
                 if y == base or y == x:
                     continue
                 checked += 1
-                r = _try_triangle(client, symbols, base, x, y, min_profit_pct, max_profit_pct, depth_cache=depth_cache)
+                r = _try_triangle(
+                    client, symbols, base, x, y, 
+                    min_profit_pct, max_profit_pct, 
+                    depth_cache=depth_cache,
+                    available_balance=available_balance
+                )
                 if r:
                     logger.debug(f"Found route: {r.a} → {r.b} → {r.c}, profit: {r.profit_pct}%, volume: ${r.volume_usd}")
                     cand.append(r)

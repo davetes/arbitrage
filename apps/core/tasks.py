@@ -7,6 +7,7 @@ import json
 import requests
 from .models import BotSettings, Route
 from .arbitrage import find_candidate_routes
+from .trading import get_account_balance
 
 
 def _t(key: str, lang: str = None) -> str:
@@ -51,9 +52,23 @@ def scan_triangular_routes():
         if not cfg.scanning_enabled:
             return "disabled"
 
+        # Get available balance if use_entire_balance is enabled
+        available_balance = None
+        if cfg.use_entire_balance:
+            try:
+                balances = get_account_balance(cfg.base_asset.upper())
+                available_balance = balances.get(cfg.base_asset.upper(), 0.0)
+                if available_balance > 0:
+                    # Use 95% of balance to leave some buffer
+                    available_balance = available_balance * 0.95
+            except Exception as e:
+                # If balance check fails, fall back to normal behavior
+                available_balance = None
+
         candidates = find_candidate_routes(
             min_profit_pct=cfg.min_profit_pct,
             max_profit_pct=cfg.max_profit_pct,
+            available_balance=available_balance,
         )
         created = 0
         lang = cfg.bot_language if cfg.bot_language else S.BOT_LANGUAGE

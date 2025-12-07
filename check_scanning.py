@@ -73,6 +73,7 @@ print(f"  max_profit_pct: {cfg.max_profit_pct}")
 print(f"  base_asset: {cfg.base_asset}")
 print(f"  min_notional_usd: {cfg.min_notional_usd}")
 print(f"  max_notional_usd: {cfg.max_notional_usd}")
+print(f"  use_entire_balance: {cfg.use_entire_balance}")
 print(f"  bot_language: {cfg.bot_language}")
 
 

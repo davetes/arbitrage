@@ -77,6 +77,9 @@ def t(key: str, lang: str = None) -> str:
         "enabled": "Включено",
         "disabled": "Выключено",
         "toggle_scanning": "Переключить сканирование",
+        "use_entire_balance": "Использовать весь баланс",
+        "entire_balance": "Весь баланс",
+        "fixed_amount": "Фиксированная сумма",
     }
     en = {
         "ready": "Arbitrage bot ready. Use buttons to control scanning.",
@@ -117,6 +120,9 @@ def t(key: str, lang: str = None) -> str:
         "enabled": "Enabled",
         "disabled": "Disabled",
         "toggle_scanning": "Toggle Scanning",
+        "use_entire_balance": "Use Entire Balance",
+        "entire_balance": "Entire Balance",
+        "fixed_amount": "Fixed Amount",
     }
     return ru.get(key) if lang and lang.lower().startswith("ru") else en.get(key)
 
@@ -152,6 +158,7 @@ def kb_settings_menu(lang: str = None):
         [InlineKeyboardButton(text=t("max_profit", lang), callback_data="config:max_profit")],
         [InlineKeyboardButton(text=t("min_notional", lang), callback_data="config:min_notional")],
         [InlineKeyboardButton(text=t("max_notional", lang), callback_data="config:max_notional")],
+        [InlineKeyboardButton(text="💰 " + t("use_entire_balance", lang), callback_data="config:use_entire_balance")],
         [InlineKeyboardButton(text="🌐 " + t("language", lang), callback_data="config:language")],
         [InlineKeyboardButton(text="🔄 " + t("toggle_scanning", lang), callback_data="config:toggle_scan")],
         [InlineKeyboardButton(text="🔙 " + t("back", lang), callback_data="config:back")],
@@ -261,12 +268,14 @@ async def main():
         lang = cfg.bot_language
         lang_display = "🇷🇺 Русский" if lang == "ru" else "🇬🇧 English"
         scanning_status = f"✅ {t('enabled', lang)}" if cfg.scanning_enabled else f"❌ {t('disabled', lang)}"
+        balance_mode_status = f"✅ {t('enabled', lang)}" if cfg.use_entire_balance else f"❌ {t('disabled', lang)}"
         text = (
             f"{t('config_menu', lang)}\n\n"
             f"📊 {t('min_profit', lang)}: {cfg.min_profit_pct}%\n"
             f"📊 {t('max_profit', lang)}: {cfg.max_profit_pct}%\n"
             f"💰 {t('min_notional', lang)}: ${cfg.min_notional_usd:,.0f}\n"
             f"💰 {t('max_notional', lang)}: ${cfg.max_notional_usd:,.0f}\n"
+            f"💵 {t('use_entire_balance', lang)}: {balance_mode_status}\n"
             f"🌐 {t('language', lang)}: {lang_display}\n"
             f"🔄 {t('scanning', lang)}: {scanning_status}\n"
             f"💱 {t('base_asset', lang)}: {cfg.base_asset}"
@@ -412,20 +421,31 @@ async def main():
             await cb.answer(t("not_valid", lang), show_alert=True)
             return
         
-        # Calculate executable amount: min(route_volume, max_notional, account_balance)
+        # Calculate executable amount
         try:
             balances = await sync_to_async(get_account_balance)(S.BASE_ASSET.upper())
             available_balance = balances.get(S.BASE_ASSET.upper(), 0.0)
         except Exception:
             available_balance = S.MAX_NOTIONAL_USD  # Fallback if balance check fails
         
-        notional = min(new_cand.volume_usd, S.MAX_NOTIONAL_USD, available_balance)
+        # Use entire balance if enabled, otherwise use normal logic
+        if cfg.use_entire_balance:
+            # Use 95% of balance to leave buffer
+            notional = available_balance * 0.95
+            # Still respect route capacity and max notional
+            notional = min(notional, new_cand.volume_usd, S.MAX_NOTIONAL_USD)
+            balance_mode = t("entire_balance", lang)
+        else:
+            # Normal logic: min(route_volume, max_notional, account_balance)
+            notional = min(new_cand.volume_usd, S.MAX_NOTIONAL_USD, available_balance)
+            balance_mode = t("fixed_amount", lang)
         
         text = (
             f"{t('confirm_title', lang)}\n"
             f"Route: {new_cand.a} → {new_cand.b} → {new_cand.c}\n"
             f"Profit: {new_cand.profit_pct:.2f}%\n"
             f"Available balance: ${available_balance:,.2f}\n"
+            f"Mode: {balance_mode}\n"
             f"Planned notional: ${notional:,.2f}"
         )
         await cb.message.edit_text(text, reply_markup=kb_confirm(route_id, lang))
@@ -447,12 +467,14 @@ async def main():
         lang = cfg.bot_language
         lang_display = "🇷🇺 Русский" if lang == "ru" else "🇬🇧 English"
         scanning_status = f"✅ {t('enabled', lang)}" if cfg.scanning_enabled else f"❌ {t('disabled', lang)}"
+        balance_mode_status = f"✅ {t('enabled', lang)}" if cfg.use_entire_balance else f"❌ {t('disabled', lang)}"
         text = (
             f"{t('config_menu', lang)}\n\n"
             f"📊 {t('min_profit', lang)}: {cfg.min_profit_pct}%\n"
             f"📊 {t('max_profit', lang)}: {cfg.max_profit_pct}%\n"
             f"💰 {t('min_notional', lang)}: ${cfg.min_notional_usd:,.0f}\n"
             f"💰 {t('max_notional', lang)}: ${cfg.max_notional_usd:,.0f}\n"
+            f"💵 {t('use_entire_balance', lang)}: {balance_mode_status}\n"
             f"🌐 {t('language', lang)}: {lang_display}\n"
             f"🔄 {t('scanning', lang)}: {scanning_status}\n"
             f"💱 {t('base_asset', lang)}: {cfg.base_asset}"
@@ -481,12 +503,38 @@ async def main():
             # Return to config menu
             lang_display = "🇷🇺 Русский" if lang == "ru" else "🇬🇧 English"
             scanning_status = f"✅ {t('enabled', lang)}" if cfg.scanning_enabled else f"❌ {t('disabled', lang)}"
+            balance_mode_status = f"✅ {t('enabled', lang)}" if cfg.use_entire_balance else f"❌ {t('disabled', lang)}"
             text = (
                 f"{t('config_menu', lang)}\n\n"
                 f"📊 {t('min_profit', lang)}: {cfg.min_profit_pct}%\n"
                 f"📊 {t('max_profit', lang)}: {cfg.max_profit_pct}%\n"
                 f"💰 {t('min_notional', lang)}: ${cfg.min_notional_usd:,.0f}\n"
                 f"💰 {t('max_notional', lang)}: ${cfg.max_notional_usd:,.0f}\n"
+                f"💵 {t('use_entire_balance', lang)}: {balance_mode_status}\n"
+                f"🌐 {t('language', lang)}: {lang_display}\n"
+                f"🔄 {t('scanning', lang)}: {scanning_status}\n"
+                f"💱 {t('base_asset', lang)}: {cfg.base_asset}"
+            )
+            await cb.message.edit_text(text, reply_markup=kb_settings_menu(lang))
+            return
+        
+        if setting == "use_entire_balance":
+            cfg.use_entire_balance = not cfg.use_entire_balance
+            await sync_to_async(cfg.save)()
+            balance_status_text = t('enabled', lang) if cfg.use_entire_balance else t('disabled', lang)
+            await cb.answer(f"{t('use_entire_balance', lang)} {balance_status_text}")
+            
+            # Return to config menu
+            lang_display = "🇷🇺 Русский" if lang == "ru" else "🇬🇧 English"
+            scanning_status = f"✅ {t('enabled', lang)}" if cfg.scanning_enabled else f"❌ {t('disabled', lang)}"
+            balance_mode_status = f"✅ {t('enabled', lang)}" if cfg.use_entire_balance else f"❌ {t('disabled', lang)}"
+            text = (
+                f"{t('config_menu', lang)}\n\n"
+                f"📊 {t('min_profit', lang)}: {cfg.min_profit_pct}%\n"
+                f"📊 {t('max_profit', lang)}: {cfg.max_profit_pct}%\n"
+                f"💰 {t('min_notional', lang)}: ${cfg.min_notional_usd:,.0f}\n"
+                f"💰 {t('max_notional', lang)}: ${cfg.max_notional_usd:,.0f}\n"
+                f"💵 {t('use_entire_balance', lang)}: {balance_mode_status}\n"
                 f"🌐 {t('language', lang)}: {lang_display}\n"
                 f"🔄 {t('scanning', lang)}: {scanning_status}\n"
                 f"💱 {t('base_asset', lang)}: {cfg.base_asset}"
@@ -580,12 +628,14 @@ async def main():
         # Return to config menu with updated language
         lang_display = "🇷🇺 Русский" if lang == "ru" else "🇬🇧 English"
         scanning_status = f"✅ {t('enabled', lang)}" if cfg.scanning_enabled else f"❌ {t('disabled', lang)}"
+        balance_mode_status = f"✅ {t('enabled', lang)}" if cfg.use_entire_balance else f"❌ {t('disabled', lang)}"
         text = (
             f"{t('config_menu', lang)}\n\n"
             f"📊 {t('min_profit', lang)}: {cfg.min_profit_pct}%\n"
             f"📊 {t('max_profit', lang)}: {cfg.max_profit_pct}%\n"
             f"💰 {t('min_notional', lang)}: ${cfg.min_notional_usd:,.0f}\n"
             f"💰 {t('max_notional', lang)}: ${cfg.max_notional_usd:,.0f}\n"
+            f"💵 {t('use_entire_balance', lang)}: {balance_mode_status}\n"
             f"🌐 {t('language', lang)}: {lang_display}\n"
             f"🔄 {t('scanning', lang)}: {scanning_status}\n"
             f"💱 {t('base_asset', lang)}: {cfg.base_asset}"
@@ -610,7 +660,7 @@ async def main():
             await cb.answer(t("trade_disabled", lang), show_alert=True)
             return
         
-        # Calculate executable amount: min(route_volume, max_notional, account_balance)
+        # Calculate executable amount
         # Re-check balance right before execution (balance may have changed)
         try:
             balances = await sync_to_async(get_account_balance)(S.BASE_ASSET.upper())
@@ -619,7 +669,15 @@ async def main():
             await cb.answer(f"Balance check failed: {e}", show_alert=True)
             return
         
-        notional = min(new_cand.volume_usd, S.MAX_NOTIONAL_USD, available_balance)
+        # Use entire balance if enabled, otherwise use normal logic
+        if cfg.use_entire_balance:
+            # Use 95% of balance to leave buffer
+            notional = available_balance * 0.95
+            # Still respect route capacity and max notional
+            notional = min(notional, new_cand.volume_usd, S.MAX_NOTIONAL_USD)
+        else:
+            # Normal logic: min(route_volume, max_notional, account_balance)
+            notional = min(new_cand.volume_usd, S.MAX_NOTIONAL_USD, available_balance)
         
         if notional < S.MIN_NOTIONAL_USD:
             await cb.answer(f"Insufficient balance. Need ${S.MIN_NOTIONAL_USD:.2f}, have ${available_balance:.2f}", show_alert=True)
