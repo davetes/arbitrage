@@ -578,6 +578,7 @@ def find_candidate_routes(
         stats["symbols_loaded"] = len(symbols)
         logger.info(f"Loaded {len(symbols)} symbols, filtering for profit: {min_profit_pct}% - {max_profit_pct}%")
         
+        base = S.BASE_ASSET.upper()
         # Expanded universe of popular trading pairs with good liquidity
         universe = [
             "BTC", "ETH", "BNB", "SOL", "ADA", "XRP", "DOGE", "MATIC", 
@@ -586,25 +587,30 @@ def find_candidate_routes(
             "BICO", "LISTA", "APT", "ARB", "OP", "SUI", "SEI", "TIA"
         ]
         
-        # Step 1: Collect all unique symbols needed for ALL triangles (not just base-asset triangles)
+        # Filter out base asset from universe (we'll use it as starting point)
+        universe = [asset for asset in universe if asset != base]
+        
+        # Step 1: Collect all unique symbols needed for BASE-asset triangles only
+        # Routes: BASE → y → z → BASE (where y and z are from universe)
         needed_symbols = set()
-        # For each combination of 3 assets (x, y, z), we need pairs: XY/YX, YZ/ZY, ZX/XZ
-        for i, x in enumerate(universe):
-            for j, y in enumerate(universe[i + 1:], start=i + 1):
-                for z in universe[j + 1:]:
-                    if x == y or y == z or x == z:
-                        continue
-                    # Add all possible pair combinations for triangle x->y->z->x
-                    needed_symbols.add(f"{x}{y}")
-                    needed_symbols.add(f"{y}{x}")
-                    needed_symbols.add(f"{y}{z}")
-                    needed_symbols.add(f"{z}{y}")
-                    needed_symbols.add(f"{z}{x}")
-                    needed_symbols.add(f"{x}{z}")
+        for i, y in enumerate(universe):
+            for z in universe[i + 1:]:
+                if y == z:
+                    continue
+                # Add all possible pair combinations for triangle BASE->y->z->BASE
+                # Leg 1: BASE -> y (need BASE/Y or Y/BASE)
+                needed_symbols.add(f"{base}{y}")
+                needed_symbols.add(f"{y}{base}")
+                # Leg 2: y -> z (need Y/Z or Z/Y)
+                needed_symbols.add(f"{y}{z}")
+                needed_symbols.add(f"{z}{y}")
+                # Leg 3: z -> BASE (need Z/BASE or BASE/Z)
+                needed_symbols.add(f"{z}{base}")
+                needed_symbols.add(f"{base}{z}")
         
         # Filter to only symbols that exist
         existing_symbols = [s for s in needed_symbols if s in symbols]
-        logger.info(f"Pre-fetching depths for {len(existing_symbols)} unique symbols (all triangles)...")
+        logger.info(f"Pre-fetching depths for {len(existing_symbols)} unique symbols (BASE-asset triangles only)...")
         
         # Step 2: Fetch all depths in parallel
         start_fetch = time.time()
@@ -615,41 +621,41 @@ def find_candidate_routes(
         stats["fetch_time"] = fetch_time
         logger.info(f"Fetched {fetched_count}/{len(existing_symbols)} depths in {fetch_time:.2f}s (parallel)")
         
-        # Step 3: Check ALL triangles using cached depths (x -> y -> z -> x for any x, y, z)
+        # Step 3: Check BASE-asset triangles only: BASE -> y -> z -> BASE
         cand: List[CandidateRoute] = []
         checked = 0
         start_triangles = time.time()
-        for i, x in enumerate(universe):
-            for j, y in enumerate(universe[i + 1:], start=i + 1):
-                for z in universe[j + 1:]:
-                    if x == y or y == z or x == z:
-                        continue
-                    checked += 1
-                    r = _try_triangle_generic(
-                        client, symbols, x, y, z,
-                        min_profit_pct, max_profit_pct,
-                        depth_cache=depth_cache,
-                        available_balance=available_balance,
-                        stats=stats
+        for i, y in enumerate(universe):
+            for z in universe[i + 1:]:
+                if y == z:
+                    continue
+                checked += 1
+                # Use the specialized _try_triangle function for base-asset routes
+                # This ensures routes start and end with BASE (USDT)
+                r = _try_triangle(
+                    client, symbols, base, y, z,
+                    min_profit_pct, max_profit_pct,
+                    depth_cache=depth_cache,
+                    available_balance=available_balance
+                )
+                if r:
+                    logger.debug(f"Found route: {r.a} → {r.b} → {r.c}, profit: {r.profit_pct}%, volume: ${r.volume_usd}")
+                    cand.append(r)
+                else:
+                    # Check if pairs exist (for missing pairs tracking)
+                    pair1_y = f"{y}{base}"
+                    pair1_y_inv = f"{base}{y}"
+                    pair2_yz = f"{y}{z}"
+                    pair2_zy = f"{z}{y}"
+                    pair3_z = f"{z}{base}"
+                    pair3_z_inv = f"{base}{z}"
+                    pairs_exist = (
+                        (pair1_y in symbols or pair1_y_inv in symbols) and
+                        (pair2_yz in symbols or pair2_zy in symbols) and
+                        (pair3_z in symbols or pair3_z_inv in symbols)
                     )
-                    if r:
-                        logger.debug(f"Found route: {r.a} → {r.b} → {r.c}, profit: {r.profit_pct}%, volume: ${r.volume_usd}")
-                        cand.append(r)
-                    else:
-                        # Check if pairs exist (for missing pairs tracking)
-                        pair1_xy = f"{x}{y}"
-                        pair1_yx = f"{y}{x}"
-                        pair2_yz = f"{y}{z}"
-                        pair2_zy = f"{z}{y}"
-                        pair3_zx = f"{z}{x}"
-                        pair3_xz = f"{x}{z}"
-                        pairs_exist = (
-                            (pair1_xy in symbols or pair1_yx in symbols) and
-                            (pair2_yz in symbols or pair2_zy in symbols) and
-                            (pair3_zx in symbols or pair3_xz in symbols)
-                        )
-                        if not pairs_exist and stats is not None:
-                            stats["filtered_missing_pairs"] = stats.get("filtered_missing_pairs", 0) + 1
+                    if not pairs_exist and stats is not None:
+                        stats["filtered_missing_pairs"] = stats.get("filtered_missing_pairs", 0) + 1
         
         triangle_time = time.time() - start_triangles
         stats["triangles_checked"] = checked
