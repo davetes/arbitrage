@@ -102,7 +102,7 @@ def scan_triangular_routes():
                             [{"text": _t("exec", lang), "callback_data": f"exec:{r.id}"}],
                         ]
                     }
-                    text = f"Route: {r.leg_a} → {r.leg_b} → {r.leg_c}\nProfit: {r.profit_pct:.2f}%\nVolume: ${r.volume_usd:,.0f}"
+                    text = f"Route:\n{r.leg_a}\n{r.leg_b}\n{r.leg_c}\n\nProfit: {r.profit_pct:.2f}%\nVolume: ${r.volume_usd:,.0f}"
                     url = f"https://api.telegram.org/bot{S.TELEGRAM_BOT_TOKEN}/sendMessage"
                     payload = {
                         "chat_id": S.ADMIN_TELEGRAM_ID,
