@@ -2,6 +2,7 @@ from dataclasses import dataclass
 from typing import List, Optional, Dict, Tuple
 from binance.spot import Spot as BinanceClient
 from arbbot import settings as S
+from .symbol_loader import get_symbol_loader
 import time
 
 
@@ -14,10 +15,12 @@ class CandidateRoute:
     volume_usd: float
 
 
-def _client() -> BinanceClient:
+def _client(timeout: int = None) -> BinanceClient:
     # Public endpoints are sufficient for order books; keys optional
     # Add timeout to prevent hanging on network issues
-    timeout = 15  # increase timeout to reduce ReadTimeouts
+    # Default 30s for exchangeInfo (large download), can be overridden
+    if timeout is None:
+        timeout = 30  # Increased for exchangeInfo downloads (15.5MB)
     kwargs = {
         "timeout": timeout,
         "base_url": getattr(S, "BINANCE_BASE_URL", "https://api.binance.com"),
@@ -31,19 +34,9 @@ def _client() -> BinanceClient:
 
 
 def _load_symbols(client: BinanceClient) -> Dict[str, dict]:
-    # retry exchange_info a few times on transient errors/timeouts
-    backoff = 0.5
-    last_err: Optional[Exception] = None
-    for _ in range(3):
-        try:
-            info = client.exchange_info()
-            return {s["symbol"]: s for s in info.get("symbols", []) if s.get("status") == "TRADING"}
-        except Exception as e:
-            last_err = e
-            time.sleep(backoff)
-            backoff *= 2
-    # If still failing, bubble up the last error to be caught by caller
-    raise last_err  # type: ignore[misc]
+    """Load symbols using FastSymbolLoader (cached, USDT-filtered)"""
+    loader = get_symbol_loader(cache_ttl_seconds=300)  # 5 minute cache
+    return loader.load_symbols(client, base_asset=S.BASE_ASSET, use_cache=True)
 
 
 def _depth_snapshot(client: BinanceClient, symbol: str, depth: int = 20) -> Optional[dict]:
@@ -76,7 +69,15 @@ def _depth_snapshot(client: BinanceClient, symbol: str, depth: int = 20) -> Opti
     return None
 
 
-def _try_triangle(client: BinanceClient, symbols: Dict[str, dict], base: str, x: str, y: str) -> Optional[CandidateRoute]:
+def _try_triangle(
+    client: BinanceClient, 
+    symbols: Dict[str, dict], 
+    base: str, 
+    x: str, 
+    y: str,
+    min_profit_pct: float = None,
+    max_profit_pct: float = None
+) -> Optional[CandidateRoute]:
     # Route: base -> x -> y -> base using available direction per symbol existence
     # Pairs considered: XBASE, XY or YX, YBASE
     pair1 = f"{x}{base}"
@@ -162,7 +163,11 @@ def _try_triangle(client: BinanceClient, symbols: Dict[str, dict], base: str, x:
     net = eff1 * eff2 * eff3
     profit_pct = (net - 1.0) * 100.0
 
-    if profit_pct < S.MIN_PROFIT_PCT or profit_pct > S.MAX_PROFIT_PCT:
+    # Use passed parameters or fallback to settings
+    min_prof = min_profit_pct if min_profit_pct is not None else S.MIN_PROFIT_PCT
+    max_prof = max_profit_pct if max_profit_pct is not None else S.MAX_PROFIT_PCT
+    
+    if profit_pct < min_prof or profit_pct > max_prof:
         return None
 
     # Capacity estimation using shallow depth snapshot
@@ -186,9 +191,14 @@ def _try_triangle(client: BinanceClient, symbols: Dict[str, dict], base: str, x:
 
 
 def find_candidate_routes(*, min_profit_pct: float, max_profit_pct: float) -> List[CandidateRoute]:
+    import logging
+    logger = logging.getLogger(__name__)
+    
     try:
         client = _client()
         symbols = _load_symbols(client)
+        logger.info(f"Loaded {len(symbols)} symbols, filtering for profit: {min_profit_pct}% - {max_profit_pct}%")
+        
         base = S.BASE_ASSET.upper()
         # Expanded universe of popular trading pairs with good liquidity
         universe = [
@@ -198,25 +208,25 @@ def find_candidate_routes(*, min_profit_pct: float, max_profit_pct: float) -> Li
             "BICO", "LISTA", "APT", "ARB", "OP", "SUI", "SEI", "TIA"
         ]
         cand: List[CandidateRoute] = []
-        routes_found_before_filter = 0
+        checked = 0
         for i, x in enumerate(universe):
             if x == base:
                 continue
             for y in universe[i + 1 :]:
                 if y == base or y == x:
                     continue
-                r = _try_triangle(client, symbols, base, x, y)
+                checked += 1
+                r = _try_triangle(client, symbols, base, x, y, min_profit_pct, max_profit_pct)
                 if r:
-                    routes_found_before_filter += 1
-                    # Clamp to provided thresholds at call-site too
-                    if r.profit_pct >= min_profit_pct and r.profit_pct <= max_profit_pct:
-                        cand.append(r)
+                    logger.debug(f"Found route: {r.a} → {r.b} → {r.c}, profit: {r.profit_pct}%, volume: ${r.volume_usd}")
+                    cand.append(r)
+        
+        logger.info(f"Checked {checked} triangle combinations, found {len(cand)} profitable routes")
         # Sort by profit desc and return a few
         cand.sort(key=lambda z: z.profit_pct, reverse=True)
         return cand[:5]
     except Exception as e:
-        import logging
-        logging.error(f"Error in find_candidate_routes: {e}", exc_info=True)
+        logger.error(f"Error in find_candidate_routes: {e}", exc_info=True)
         return []
 
 
