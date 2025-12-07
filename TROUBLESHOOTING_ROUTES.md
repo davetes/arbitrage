@@ -136,3 +136,4 @@ Then restart Celery worker and beat.
 - **Network latency matters** - routes may be invalid by the time you execute
 - **Fees reduce profits** - ensure your fee settings match your account (default 0.1% = 10 bps)
 
+

@@ -276,13 +276,27 @@ def find_candidate_routes(
     min_profit_pct: float, 
     max_profit_pct: float,
     available_balance: float = None
-) -> List[CandidateRoute]:
-    import logging
+) -> Tuple[List[CandidateRoute], dict]:
+    """
+    Find candidate triangular arbitrage routes.
+    Returns: (routes_list, stats_dict)
+    stats_dict contains: symbols_loaded, symbols_fetched, triangles_checked, routes_found
+    """
     logger = logging.getLogger(__name__)
+    
+    stats = {
+        "symbols_loaded": 0,
+        "symbols_fetched": 0,
+        "triangles_checked": 0,
+        "routes_found": 0,
+        "fetch_time": 0.0,
+        "triangle_time": 0.0,
+    }
     
     try:
         client = _client()
         symbols = _load_symbols(client)
+        stats["symbols_loaded"] = len(symbols)
         logger.info(f"Loaded {len(symbols)} symbols, filtering for profit: {min_profit_pct}% - {max_profit_pct}%")
         
         base = S.BASE_ASSET.upper()
@@ -319,6 +333,8 @@ def find_candidate_routes(
         depth_cache = _fetch_depth_parallel(client, existing_symbols, max_workers=20)
         fetch_time = time.time() - start_fetch
         fetched_count = sum(1 for v in depth_cache.values() if v is not None)
+        stats["symbols_fetched"] = fetched_count
+        stats["fetch_time"] = fetch_time
         logger.info(f"Fetched {fetched_count}/{len(existing_symbols)} depths in {fetch_time:.2f}s (parallel)")
         
         # Step 3: Check triangles using cached depths
@@ -343,15 +359,18 @@ def find_candidate_routes(
                     cand.append(r)
         
         triangle_time = time.time() - start_triangles
+        stats["triangles_checked"] = checked
+        stats["routes_found"] = len(cand)
+        stats["triangle_time"] = triangle_time
         logger.info(f"Checked {checked} triangles in {triangle_time:.2f}s ({triangle_time/checked*1000:.1f}ms per triangle)")
         
         logger.info(f"Checked {checked} triangle combinations, found {len(cand)} profitable routes")
         # Sort by profit desc and return a few
         cand.sort(key=lambda z: z.profit_pct, reverse=True)
-        return cand[:5]
+        return cand[:5], stats
     except Exception as e:
         logger.error(f"Error in find_candidate_routes: {e}", exc_info=True)
-        return []
+        return [], stats
 
 
 def _parse_leg(label: str) -> Tuple[str, str, str]:

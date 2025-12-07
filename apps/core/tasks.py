@@ -73,7 +73,7 @@ def scan_triangular_routes():
                 logger.warning(f"Balance check failed: {e}, falling back to normal behavior")
                 available_balance = None
 
-        candidates = find_candidate_routes(
+        candidates, stats = find_candidate_routes(
             min_profit_pct=cfg.min_profit_pct,
             max_profit_pct=cfg.max_profit_pct,
             available_balance=available_balance,
@@ -118,6 +118,61 @@ def scan_triangular_routes():
                             logger.warning(f"Telegram notification failed for route {r.id}: {response.status_code} - {response.text}")
                 except Exception as e:
                     logger.error(f"Failed to send Telegram notification for route {r.id}: {e}", exc_info=True)
+        
+        # Send summary message to Telegram
+        try:
+            if S.TELEGRAM_BOT_TOKEN and S.ADMIN_TELEGRAM_ID:
+                # Get translations
+                def _get_translation(key: str) -> str:
+                    ru_translations = {
+                        "scan_summary": "📊 Сводка сканирования",
+                        "symbols_loaded": "📈 Символов загружено",
+                        "depths_fetched": "🔍 Глубин получено",
+                        "triangles_checked": "🔺 Треугольников проверено",
+                        "routes_found": "✅ Маршрутов найдено",
+                        "routes_created": "💾 Маршрутов создано",
+                        "no_routes_found": "⚠️ Прибыльных маршрутов не найдено в этом сканировании.",
+                        "routes_saved": "🎉 {count} маршрут(ов) сохранено в базу данных!",
+                    }
+                    en_translations = {
+                        "scan_summary": "📊 Scan Summary",
+                        "symbols_loaded": "📈 Symbols loaded",
+                        "depths_fetched": "🔍 Depths fetched",
+                        "triangles_checked": "🔺 Triangles checked",
+                        "routes_found": "✅ Routes found",
+                        "routes_created": "💾 Routes created",
+                        "no_routes_found": "⚠️ No profitable routes found in this scan.",
+                        "routes_saved": "🎉 {count} route(s) saved to database!",
+                    }
+                    translations = ru_translations if lang and lang.lower().startswith("ru") else en_translations
+                    return translations.get(key, key)
+                
+                summary_text = (
+                    f"{_get_translation('scan_summary')}\n\n"
+                    f"{_get_translation('symbols_loaded')}: {stats['symbols_loaded']}\n"
+                    f"{_get_translation('depths_fetched')}: {stats['symbols_fetched']} ({stats['fetch_time']:.2f}s)\n"
+                    f"{_get_translation('triangles_checked')}: {stats['triangles_checked']}\n"
+                    f"{_get_translation('routes_found')}: {stats['routes_found']}\n"
+                    f"{_get_translation('routes_created')}: {created}"
+                )
+                if created == 0:
+                    summary_text += f"\n\n{_get_translation('no_routes_found')}"
+                else:
+                    summary_text += f"\n\n{_get_translation('routes_saved').format(count=created)}"
+                
+                url = f"https://api.telegram.org/bot{S.TELEGRAM_BOT_TOKEN}/sendMessage"
+                payload = {
+                    "chat_id": S.ADMIN_TELEGRAM_ID,
+                    "text": summary_text,
+                    "disable_web_page_preview": True,
+                }
+                response = requests.post(url, data=payload, timeout=10)
+                if response.status_code == 200:
+                    logger.info("Summary message sent to Telegram")
+                else:
+                    logger.warning(f"Failed to send summary message: {response.status_code} - {response.text}")
+        except Exception as e:
+            logger.error(f"Failed to send summary message: {e}", exc_info=True)
         
         result_msg = f"routes_created={created} at {timezone.now()}"
         logger.info(result_msg)

@@ -80,6 +80,15 @@ def t(key: str, lang: str = None) -> str:
         "use_entire_balance": "Использовать весь баланс",
         "entire_balance": "Весь баланс",
         "fixed_amount": "Фиксированная сумма",
+        "scan_started": "Сканирование запущено",
+        "scan_summary": "Сводка сканирования",
+        "symbols_loaded": "Символов загружено",
+        "depths_fetched": "Глубин получено",
+        "triangles_checked": "Треугольников проверено",
+        "routes_found": "Маршрутов найдено",
+        "routes_created": "Маршрутов создано",
+        "no_routes_found": "Прибыльных маршрутов не найдено",
+        "routes_saved": "маршрут(ов) сохранено в базу данных",
     }
     en = {
         "ready": "Arbitrage bot ready. Use buttons to control scanning.",
@@ -123,6 +132,15 @@ def t(key: str, lang: str = None) -> str:
         "use_entire_balance": "Use Entire Balance",
         "entire_balance": "Entire Balance",
         "fixed_amount": "Fixed Amount",
+        "scan_started": "Scanning started",
+        "scan_summary": "Scan Summary",
+        "symbols_loaded": "Symbols loaded",
+        "depths_fetched": "Depths fetched",
+        "triangles_checked": "Triangles checked",
+        "routes_found": "Routes found",
+        "routes_created": "Routes created",
+        "no_routes_found": "No profitable routes found in this scan",
+        "routes_saved": "route(s) saved to database",
     }
     return ru.get(key) if lang and lang.lower().startswith("ru") else en.get(key)
 
@@ -357,10 +375,11 @@ async def main():
             )
             if cfg.scanning_enabled:
                 message_text += (
-                    f"🔍 Searching for arbitrage routes...\n"
+                    f"🔍 {t('scan_started', lang)}\n\n"
                     f"📊 Profit range: {cfg.min_profit_pct}% - {cfg.max_profit_pct}%\n"
                     f"💰 Volume: ${cfg.min_notional_usd:,.0f} - ${cfg.max_notional_usd:,.0f}\n\n"
-                    f"💡 Make sure Celery worker and beat are running!"
+                    f"💡 Make sure Celery worker and beat are running!\n\n"
+                    f"📈 You will receive scan summaries after each scan cycle."
                 )
             else:
                 message_text += "⏸️ Route scanning stopped."
