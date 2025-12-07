@@ -139,7 +139,8 @@ def _try_triangle_generic(
     min_profit_pct: float = None,
     max_profit_pct: float = None,
     depth_cache: Dict[str, Optional[dict]] = None,
-    available_balance: float = None
+    available_balance: float = None,
+    stats: dict = None
 ) -> Optional[CandidateRoute]:
     """
     Try to find a triangular arbitrage route: x -> y -> z -> x
@@ -259,11 +260,18 @@ def _try_triangle_generic(
     min_prof = min_profit_pct if min_profit_pct is not None else S.MIN_PROFIT_PCT
     max_prof = max_profit_pct if max_profit_pct is not None else S.MAX_PROFIT_PCT
     
+    # Track profit statistics
+    if stats is not None:
+        if len(stats.get("sample_profits", [])) < 100:
+            stats["sample_profits"].append(profit_pct)
+    
     # Log filtered routes for debugging (only log a sample to avoid spam)
     if profit_pct < min_prof or profit_pct > max_prof:
+        if stats is not None:
+            stats["filtered_profit"] = stats.get("filtered_profit", 0) + 1
         # Log occasionally to help diagnose threshold issues
         if random.random() < 0.01:  # Log 1% of filtered routes
-            logger.debug(f"Route filtered: {x}-{y}-{z} profit={profit_pct:.4f}% (range: {min_prof}%-{max_prof}%)")
+            logger.debug(f"Route filtered by profit: {x}-{y}-{z} profit={profit_pct:.4f}% (range: {min_prof}%-{max_prof}%)")
         return None
 
     # Capacity estimation - convert all to X terms
@@ -308,11 +316,15 @@ def _try_triangle_generic(
     
     # If we can't convert to USD, skip this route (or use a fallback)
     if max_volume_usd is None or max_volume_usd <= 0:
+        if stats is not None:
+            stats["filtered_usd_conversion"] = stats.get("filtered_usd_conversion", 0) + 1
         # Try using available_balance as fallback if provided
         if available_balance is not None and available_balance > 0:
             max_volume_usd = min(available_balance, S.MAX_NOTIONAL_USD)
         else:
             # Skip routes we can't price in USD
+            if random.random() < 0.01:  # Log 1% of filtered routes
+                logger.debug(f"Route filtered by USD conversion: {x}-{y}-{z} (no {x}/{base} or {base}/{x} pair)")
             return None
     
     # Apply limits
@@ -322,6 +334,10 @@ def _try_triangle_generic(
         max_volume_usd = min(max_volume_usd, S.MAX_NOTIONAL_USD)
     
     if max_volume_usd < S.MIN_NOTIONAL_USD:
+        if stats is not None:
+            stats["filtered_volume"] = stats.get("filtered_volume", 0) + 1
+        if random.random() < 0.01:  # Log 1% of filtered routes
+            logger.debug(f"Route filtered by volume: {x}-{y}-{z} volume=${max_volume_usd:.2f} < ${S.MIN_NOTIONAL_USD}")
         return None
 
     return CandidateRoute(
@@ -494,6 +510,11 @@ def find_candidate_routes(
         "routes_found": 0,
         "fetch_time": 0.0,
         "triangle_time": 0.0,
+        "filtered_profit": 0,
+        "filtered_usd_conversion": 0,
+        "filtered_volume": 0,
+        "filtered_missing_pairs": 0,
+        "sample_profits": [],  # Store sample profit values for analysis
     }
     
     try:
@@ -553,11 +574,27 @@ def find_candidate_routes(
                         client, symbols, x, y, z,
                         min_profit_pct, max_profit_pct,
                         depth_cache=depth_cache,
-                        available_balance=available_balance
+                        available_balance=available_balance,
+                        stats=stats
                     )
                     if r:
                         logger.debug(f"Found route: {r.a} → {r.b} → {r.c}, profit: {r.profit_pct}%, volume: ${r.volume_usd}")
                         cand.append(r)
+                    else:
+                        # Check if pairs exist (for missing pairs tracking)
+                        pair1_xy = f"{x}{y}"
+                        pair1_yx = f"{y}{x}"
+                        pair2_yz = f"{y}{z}"
+                        pair2_zy = f"{z}{y}"
+                        pair3_zx = f"{z}{x}"
+                        pair3_xz = f"{x}{z}"
+                        pairs_exist = (
+                            (pair1_xy in symbols or pair1_yx in symbols) and
+                            (pair2_yz in symbols or pair2_zy in symbols) and
+                            (pair3_zx in symbols or pair3_xz in symbols)
+                        )
+                        if not pairs_exist and stats is not None:
+                            stats["filtered_missing_pairs"] = stats.get("filtered_missing_pairs", 0) + 1
         
         triangle_time = time.time() - start_triangles
         stats["triangles_checked"] = checked
@@ -565,7 +602,22 @@ def find_candidate_routes(
         stats["triangle_time"] = triangle_time
         logger.info(f"Checked {checked} triangles in {triangle_time:.2f}s ({triangle_time/checked*1000:.1f}ms per triangle)")
         
+        # Log diagnostic information
+        filtered_profit = stats.get("filtered_profit", 0)
+        filtered_usd = stats.get("filtered_usd_conversion", 0)
+        filtered_volume = stats.get("filtered_volume", 0)
+        filtered_missing = stats.get("filtered_missing_pairs", 0)
+        sample_profits = stats.get("sample_profits", [])
+        
         logger.info(f"Checked {checked} triangle combinations, found {len(cand)} profitable routes")
+        logger.info(f"Filter statistics: profit={filtered_profit}, usd_conversion={filtered_usd}, volume={filtered_volume}, missing_pairs={filtered_missing}")
+        
+        if sample_profits:
+            sample_profits.sort()
+            logger.info(f"Sample profit range: min={min(sample_profits):.4f}%, max={max(sample_profits):.4f}%, "
+                       f"median={sample_profits[len(sample_profits)//2]:.4f}%, "
+                       f"avg={sum(sample_profits)/len(sample_profits):.4f}%")
+        
         # Sort by profit desc and return a few
         cand.sort(key=lambda z: z.profit_pct, reverse=True)
         return cand[:5], stats

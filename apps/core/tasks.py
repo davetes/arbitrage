@@ -155,8 +155,36 @@ def scan_triangular_routes():
                     f"{_get_translation('routes_found')}: {stats['routes_found']}\n"
                     f"{_get_translation('routes_created')}: {created}"
                 )
+                
+                # Add diagnostic information if no routes found
                 if created == 0:
                     summary_text += f"\n\n{_get_translation('no_routes_found')}"
+                    filtered_profit = stats.get('filtered_profit', 0)
+                    filtered_usd = stats.get('filtered_usd_conversion', 0)
+                    filtered_volume = stats.get('filtered_volume', 0)
+                    filtered_missing = stats.get('filtered_missing_pairs', 0)
+                    
+                    reasons = []
+                    if filtered_profit > 0:
+                        reasons.append(f"Profit threshold: {filtered_profit}")
+                    if filtered_usd > 0:
+                        reasons.append(f"USD conversion: {filtered_usd}")
+                    if filtered_volume > 0:
+                        reasons.append(f"Volume too small: {filtered_volume}")
+                    if filtered_missing > 0:
+                        reasons.append(f"Missing pairs: {filtered_missing}")
+                    
+                    if reasons:
+                        summary_text += f"\n\n🔍 Filtered out:\n" + "\n".join(f"  • {r}" for r in reasons)
+                    
+                    # Show sample profit statistics
+                    sample_profits = stats.get('sample_profits', [])
+                    if sample_profits:
+                        sample_profits.sort()
+                        min_prof = min(sample_profits)
+                        max_prof = max(sample_profits)
+                        avg_prof = sum(sample_profits) / len(sample_profits)
+                        summary_text += f"\n\n📊 Sample profits: {min_prof:.4f}% to {max_prof:.4f}% (avg: {avg_prof:.4f}%)"
                 else:
                     summary_text += f"\n\n{_get_translation('routes_saved').format(count=created)}"
                 
