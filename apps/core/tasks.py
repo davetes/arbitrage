@@ -5,9 +5,12 @@ from django.db import transaction
 from arbbot import settings as S
 import json
 import requests
+import logging
 from .models import BotSettings, Route
 from .arbitrage import find_candidate_routes
 from .trading import get_account_balance
+
+logger = logging.getLogger(__name__)
 
 
 def _t(key: str, lang: str = None) -> str:
@@ -50,7 +53,11 @@ def scan_triangular_routes():
             "bot_language": S.BOT_LANGUAGE,
         })
         if not cfg.scanning_enabled:
+            logger.info("Scanning is disabled, skipping route search")
             return "disabled"
+
+        logger.info(f"Starting route scan: profit_range={cfg.min_profit_pct}%-{cfg.max_profit_pct}%, "
+                   f"notional_range=${cfg.min_notional_usd}-${cfg.max_notional_usd}")
 
         # Get available balance if use_entire_balance is enabled
         available_balance = None
@@ -61,8 +68,9 @@ def scan_triangular_routes():
                 if available_balance > 0:
                     # Use 95% of balance to leave some buffer
                     available_balance = available_balance * 0.95
+                    logger.info(f"Using entire balance mode: ${available_balance:,.2f} available")
             except Exception as e:
-                # If balance check fails, fall back to normal behavior
+                logger.warning(f"Balance check failed: {e}, falling back to normal behavior")
                 available_balance = None
 
         candidates = find_candidate_routes(
@@ -70,6 +78,9 @@ def scan_triangular_routes():
             max_profit_pct=cfg.max_profit_pct,
             available_balance=available_balance,
         )
+        
+        logger.info(f"Found {len(candidates)} candidate routes")
+        
         created = 0
         lang = cfg.bot_language if cfg.bot_language else S.BOT_LANGUAGE
         with transaction.atomic():
@@ -82,6 +93,7 @@ def scan_triangular_routes():
                     volume_usd=c.volume_usd,
                 )
                 created += 1
+                logger.info(f"Created route {r.id}: {r.label()} (profit: {r.profit_pct:.4f}%, volume: ${r.volume_usd:,.2f})")
                 # Notify Telegram immediately with inline buttons
                 try:
                     kb = {
@@ -99,9 +111,18 @@ def scan_triangular_routes():
                         "disable_web_page_preview": True,
                     }
                     if S.TELEGRAM_BOT_TOKEN and S.ADMIN_TELEGRAM_ID:
-                        requests.post(url, data=payload, timeout=10)
-                except Exception:
-                    pass
-        return f"routes_created={created} at {timezone.now()}"
+                        response = requests.post(url, data=payload, timeout=10)
+                        if response.status_code == 200:
+                            logger.info(f"Telegram notification sent for route {r.id}")
+                        else:
+                            logger.warning(f"Telegram notification failed for route {r.id}: {response.status_code} - {response.text}")
+                except Exception as e:
+                    logger.error(f"Failed to send Telegram notification for route {r.id}: {e}", exc_info=True)
+        
+        result_msg = f"routes_created={created} at {timezone.now()}"
+        logger.info(result_msg)
+        return result_msg
     except Exception as e:
-        return f"error: {e}"
+        error_msg = f"error: {e}"
+        logger.error(f"Error in scan_triangular_routes: {e}", exc_info=True)
+        return error_msg

@@ -5,6 +5,7 @@ from arbbot import settings as S
 from .symbol_loader import get_symbol_loader
 import time
 import logging
+import random
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 logger = logging.getLogger(__name__)
@@ -235,7 +236,11 @@ def _try_triangle(
     min_prof = min_profit_pct if min_profit_pct is not None else S.MIN_PROFIT_PCT
     max_prof = max_profit_pct if max_profit_pct is not None else S.MAX_PROFIT_PCT
     
+    # Log filtered routes for debugging (only log a sample to avoid spam)
     if profit_pct < min_prof or profit_pct > max_prof:
+        # Log occasionally to help diagnose threshold issues
+        if random.random() < 0.01:  # Log 1% of filtered routes
+            logger.debug(f"Route filtered: {x}-{y} profit={profit_pct:.4f}% (range: {min_prof}%-{max_prof}%)")
         return None
 
     # Capacity estimation using shallow depth snapshot
