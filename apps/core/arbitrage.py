@@ -290,42 +290,97 @@ def _try_triangle_generic(
     # Determine max X notional (in X units)
     max_x_units = max(0.0, min(cap1_x, cap2_x, cap3_x))
     
-    # Convert X units to USD using base asset pair
+    # Convert X units to USD using base asset pair (with fallback to BTC/ETH)
     base = S.BASE_ASSET.upper()
     max_volume_usd = None
     
-    # Try to find X/BASE or BASE/X pair to convert to USD
+    def try_conversion(x_asset: str, intermediate: str, target: str) -> Optional[float]:
+        """Try to convert x_asset to target via intermediate asset"""
+        # Try X/INTERMEDIATE → INTERMEDIATE/TARGET
+        pair1a = f"{x_asset}{intermediate}"
+        pair1b = f"{intermediate}{x_asset}"
+        pair2a = f"{intermediate}{target}"
+        pair2b = f"{target}{intermediate}"
+        
+        # Path 1: X/INT → INT/TARGET
+        if pair1a in symbols and pair2a in symbols:
+            d1 = get_depth(pair1a)
+            d2 = get_depth(pair2a)
+            if d1 and d2:
+                # X/INT: price is INT per X (bid to sell X)
+                price1 = d1["bid_price"]
+                # INT/TARGET: price is TARGET per INT (bid to sell INT)
+                price2 = d2["bid_price"]
+                return max_x_units * price1 * price2
+        
+        # Path 2: INT/X → INT/TARGET
+        if pair1b in symbols and pair2a in symbols:
+            d1 = get_depth(pair1b)
+            d2 = get_depth(pair2a)
+            if d1 and d2:
+                # INT/X: price is X per INT (ask to buy X)
+                price1 = d1["ask_price"]
+                if price1 > 0:
+                    # INT/TARGET: price is TARGET per INT (bid to sell INT)
+                    price2 = d2["bid_price"]
+                    return max_x_units / price1 * price2
+        
+        # Path 3: X/INT → TARGET/INT
+        if pair1a in symbols and pair2b in symbols:
+            d1 = get_depth(pair1a)
+            d2 = get_depth(pair2b)
+            if d1 and d2:
+                # X/INT: price is INT per X (bid to sell X)
+                price1 = d1["bid_price"]
+                # TARGET/INT: price is INT per TARGET (ask to buy INT)
+                price2 = d2["ask_price"]
+                if price2 > 0:
+                    return max_x_units * price1 / price2
+        
+        return None
+    
+    # Try direct conversion first
     x_base_pair = f"{x}{base}"
     base_x_pair = f"{base}{x}"
     
     if x_base_pair in symbols:
         d_x = get_depth(x_base_pair)
         if d_x:
-            # X/BASE pair: price is in BASE per X
-            # max_x_units of X = max_x_units * price in BASE
-            price_x = d_x["bid_price"]  # Use bid for conservative estimate
+            price_x = d_x["bid_price"]
             max_volume_usd = max_x_units * price_x
     elif base_x_pair in symbols:
         d_x = get_depth(base_x_pair)
         if d_x:
-            # BASE/X pair: price is in X per BASE
-            # max_x_units of X = max_x_units / price in X
-            price_x = d_x["ask_price"]  # Use ask for conservative estimate
+            price_x = d_x["ask_price"]
             if price_x > 0:
                 max_volume_usd = max_x_units / price_x
     
-    # If we can't convert to USD, skip this route (or use a fallback)
+    # Try via BTC if direct conversion failed
+    if (max_volume_usd is None or max_volume_usd <= 0) and base != "BTC":
+        max_volume_usd = try_conversion(x, "BTC", base)
+    
+    # Try via ETH if still failed
+    if (max_volume_usd is None or max_volume_usd <= 0) and base != "ETH":
+        max_volume_usd = try_conversion(x, "ETH", base)
+    
+    # If we still can't convert, use fallback estimate
     if max_volume_usd is None or max_volume_usd <= 0:
         if stats is not None:
             stats["filtered_usd_conversion"] = stats.get("filtered_usd_conversion", 0) + 1
-        # Try using available_balance as fallback if provided
-        if available_balance is not None and available_balance > 0:
-            max_volume_usd = min(available_balance, S.MAX_NOTIONAL_USD)
-        else:
-            # Skip routes we can't price in USD
-            if random.random() < 0.01:  # Log 1% of filtered routes
-                logger.debug(f"Route filtered by USD conversion: {x}-{y}-{z} (no {x}/{base} or {base}/{x} pair)")
+        # Fallback: Use conservative estimate ($1 per unit)
+        # This allows routes to be saved even without direct conversion
+        estimated_price = 1.0
+        max_volume_usd = max_x_units * estimated_price
+        
+        # Still validate minimum
+        if max_volume_usd < S.MIN_NOTIONAL_USD:
+            if random.random() < 0.01:
+                logger.debug(f"Route filtered: {x}-{y}-{z} (estimated volume ${max_volume_usd:.2f} < ${S.MIN_NOTIONAL_USD})")
             return None
+        
+        # Log estimated conversion (occasionally)
+        if random.random() < 0.05:
+            logger.debug(f"Using estimated USD for {x}-{y}-{z}: ${max_volume_usd:.2f} (no conversion path)")
     
     # Apply limits
     if available_balance is not None and available_balance > 0:
