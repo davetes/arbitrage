@@ -47,9 +47,6 @@ class CandidateRoute:
     c: str  # leg3 label e.g., "SXP/USDT sell"
     profit_pct: float
     volume_usd: float
-    leg_a_price: float = None  # Price for leg A
-    leg_b_price: float = None  # Price for leg B
-    leg_c_price: float = None  # Price for leg C
 
 
 def _client(timeout: int = None) -> BinanceClient:
@@ -167,7 +164,6 @@ def _try_triangle_generic(
     
     # Leg 1: Convert X to Y
     leg1_label = None
-    leg1_price = None
     x_to_y = None
     cap1_x = None  # Capacity in X units
     
@@ -180,7 +176,6 @@ def _try_triangle_generic(
         x_to_y = 1.0 / p1_ask
         # cap_ask_quote is in X (quote currency) terms
         cap1_x = d1["cap_ask_quote"]
-        leg1_price = p1_ask  # Price: Y per X
         leg1_label = f"{y}/{x} buy"
     elif pair1_yx in symbols:
         d1 = get_depth(pair1_yx)
@@ -191,14 +186,12 @@ def _try_triangle_generic(
         x_to_y = p1_bid
         # cap_bid_quote is in X (quote currency) terms
         cap1_x = d1["cap_bid_quote"]
-        leg1_price = p1_bid  # Price: Y per X
         leg1_label = f"{x}/{y} sell"
     else:
         return None
 
     # Leg 2: Convert Y to Z
     leg2_label = None
-    leg2_price = None
     y_to_z = None
     cap2_y = None  # Capacity in Y units
     
@@ -211,7 +204,6 @@ def _try_triangle_generic(
         y_to_z = 1.0 / p2_ask
         # cap_ask_quote is in Y (quote currency) terms
         cap2_y = d2["cap_ask_quote"]
-        leg2_price = p2_ask  # Price: Z per Y
         leg2_label = f"{z}/{y} buy"
     elif pair2_zy in symbols:
         d2 = get_depth(pair2_zy)
@@ -222,14 +214,12 @@ def _try_triangle_generic(
         y_to_z = p2_bid
         # cap_bid_quote is in Y (quote currency) terms
         cap2_y = d2["cap_bid_quote"]
-        leg2_price = p2_bid  # Price: Z per Y
         leg2_label = f"{y}/{z} sell"
     else:
         return None
 
     # Leg 3: Convert Z back to X
     leg3_label = None
-    leg3_price = None
     z_to_x = None
     cap3_z = None  # Capacity in Z units
     
@@ -242,7 +232,6 @@ def _try_triangle_generic(
         z_to_x = 1.0 / p3_ask
         # cap_ask_quote is in Z (quote currency) terms
         cap3_z = d3["cap_ask_quote"]
-        leg3_price = p3_ask  # Price: X per Z
         leg3_label = f"{x}/{z} buy"
     elif pair3_xz in symbols:
         d3 = get_depth(pair3_xz)
@@ -253,7 +242,6 @@ def _try_triangle_generic(
         z_to_x = p3_bid
         # cap_bid_quote is in Z (quote currency) terms
         cap3_z = d3["cap_bid_quote"]
-        leg3_price = p3_bid  # Price: X per Z
         leg3_label = f"{z}/{x} sell"
     else:
         return None
@@ -407,46 +395,12 @@ def _try_triangle_generic(
             logger.debug(f"Route filtered by volume: {x}-{y}-{z} volume=${max_volume_usd:.2f} < ${S.MIN_NOTIONAL_USD}")
         return None
 
-    # Format labels with prices
-    def format_price(price, pair_label, x_asset, y_asset, z_asset):
-        """Format price based on pair label and assets"""
-        if price is None:
-            return pair_label
-        # Extract pair and side from label like "ETH/BNB sell"
-        parts = pair_label.split()
-        if len(parts) >= 2:
-            pair = parts[0]
-            side = parts[1] if len(parts) > 1 else ""
-            base, quote = pair.split("/")
-            
-            # Determine which asset we're getting
-            # For "ETH/BNB sell": selling ETH to get BNB, price is BNB per ETH
-            # For "ETH/BNB buy": buying BNB with ETH, price is BNB per ETH
-            if "sell" in side.lower():
-                # Selling base, getting quote
-                return f"{pair} {side}: {price:.6f} {quote}"
-            else:
-                # Buying quote with base, price is quote per base
-                return f"{pair} {side}: {price:.6f} {quote}"
-        return f"{pair_label}: {price:.6f}"
-    
-    leg_a_formatted = format_price(leg1_price, leg1_label, x, y, z)
-    leg_b_formatted = format_price(leg2_price, leg2_label, x, y, z)
-    leg_c_formatted = format_price(leg3_price, leg3_label, x, y, z)
-    
-    leg_a_formatted = format_price(leg1_price, leg1_label)
-    leg_b_formatted = format_price(leg2_price, leg2_label)
-    leg_c_formatted = format_price(leg3_price, leg3_label)
-    
     return CandidateRoute(
-        a=leg_a_formatted,
-        b=leg_b_formatted,
-        c=leg_c_formatted,
+        a=leg1_label,
+        b=leg2_label,
+        c=leg3_label,
         profit_pct=round(profit_pct, 4),
         volume_usd=round(max_volume_usd, 2),
-        leg_a_price=leg1_price,
-        leg_b_price=leg2_price,
-        leg_c_price=leg3_price,
     )
 
 
