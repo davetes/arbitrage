@@ -238,8 +238,17 @@ async def main():
         lang = cfg.bot_language
         reply_kb = await kb_global()
         logging.info(f"/start from chat_id={msg.chat.id} username={getattr(msg.from_user, 'username', '')}")
+        
+        # Add status info
+        status_emoji = "✅" if cfg.scanning_enabled else "❌"
+        status_text = t("enabled", lang) if cfg.scanning_enabled else t("disabled", lang)
+        welcome_text = (
+            f"{t('ready', lang)}\n\n"
+            f"{status_emoji} {t('scanning', lang)}: {status_text}"
+        )
+        
         await msg.answer(
-            t("ready", lang),
+            welcome_text,
             reply_markup=reply_kb,
         )
 
@@ -282,21 +291,91 @@ async def main():
         lang = cfg.bot_language if cfg.bot_language else S.BOT_LANGUAGE
         await msg.answer(t("history", lang))
 
+    @dp.message(F.text == "/status")
+    async def on_status(msg: Message):
+        """Check bot status and configuration"""
+        cfg, _ = await sync_to_async(BotSettings.objects.get_or_create)(id=1)
+        lang = cfg.bot_language if cfg.bot_language else S.BOT_LANGUAGE
+        
+        # Check recent routes
+        from apps.core.models import Route
+        recent_routes = await sync_to_async(lambda: Route.objects.order_by('-id')[:5].count())()
+        total_routes = await sync_to_async(lambda: Route.objects.count())()
+        
+        status_emoji = "✅" if cfg.scanning_enabled else "❌"
+        status_text = (
+            f"🤖 Bot Status\n\n"
+            f"{status_emoji} {t('scanning', lang)}: {t('enabled', lang) if cfg.scanning_enabled else t('disabled', lang)}\n\n"
+            f"📊 Settings:\n"
+            f"   Profit: {cfg.min_profit_pct}% - {cfg.max_profit_pct}%\n"
+            f"   Volume: ${cfg.min_notional_usd:,.0f} - ${cfg.max_notional_usd:,.0f}\n"
+            f"   Base: {cfg.base_asset}\n\n"
+            f"📈 Routes:\n"
+            f"   Total found: {total_routes}\n"
+            f"   Recent (last 5): {recent_routes}\n\n"
+        )
+        
+        if cfg.scanning_enabled:
+            status_text += (
+                f"⚠️  Make sure:\n"
+                f"   1. Celery worker is running\n"
+                f"   2. Celery beat is running\n"
+                f"   3. Redis is running\n"
+            )
+        else:
+            status_text += f"💡 Click 'Start Search' to begin scanning"
+        
+        await msg.answer(status_text, reply_markup=await kb_global())
+
 
     @dp.callback_query(F.data == "toggle_scan")
     async def toggle_scan(cb: CallbackQuery):
-        cfg, _ = await sync_to_async(BotSettings.objects.get_or_create)(id=1)
-        lang = cfg.bot_language if cfg.bot_language else S.BOT_LANGUAGE
-        cfg.scanning_enabled = not cfg.scanning_enabled
-        await sync_to_async(cfg.save)()
-        reply_kb = await kb_global()
         try:
-            await cb.message.edit_reply_markup(reply_markup=reply_kb)
-        except TelegramBadRequest:
-            # If markup/content are the same, ignore the error
-            pass
-        logging.info(f"Scanning toggled to {cfg.scanning_enabled} by chat_id={cb.from_user.id}")
-        await cb.answer(t("toggle", lang))
+            cfg, _ = await sync_to_async(BotSettings.objects.get_or_create)(id=1)
+            lang = cfg.bot_language if cfg.bot_language else S.BOT_LANGUAGE
+            old_status = cfg.scanning_enabled
+            cfg.scanning_enabled = not cfg.scanning_enabled
+            await sync_to_async(cfg.save)()
+            
+            # Get updated keyboard
+            reply_kb = await kb_global()
+            
+            # Create status message
+            status_text = t("enabled", lang) if cfg.scanning_enabled else t("disabled", lang)
+            status_emoji = "✅" if cfg.scanning_enabled else "❌"
+            message_text = (
+                f"{status_emoji} {t('scanning', lang)}: {status_text}\n\n"
+            )
+            if cfg.scanning_enabled:
+                message_text += (
+                    f"🔍 Searching for arbitrage routes...\n"
+                    f"📊 Profit range: {cfg.min_profit_pct}% - {cfg.max_profit_pct}%\n"
+                    f"💰 Volume: ${cfg.min_notional_usd:,.0f} - ${cfg.max_notional_usd:,.0f}\n\n"
+                    f"💡 Make sure Celery worker and beat are running!"
+                )
+            else:
+                message_text += "⏸️ Route scanning stopped."
+            
+            # Always answer callback first (shows popup)
+            await cb.answer(f"{t('scanning', lang)} {status_text.lower()}")
+            
+            # Try to update the button on the original message
+            try:
+                await cb.message.edit_reply_markup(reply_markup=reply_kb)
+            except TelegramBadRequest:
+                # If edit fails, that's okay - button might be on a different message
+                pass
+            
+            # Send a new message with status (always visible)
+            await cb.message.answer(message_text, reply_markup=reply_kb)
+            
+            logging.info(f"Scanning toggled from {old_status} to {cfg.scanning_enabled} by chat_id={cb.from_user.id}")
+        except Exception as e:
+            logging.error(f"Error in toggle_scan: {e}", exc_info=True)
+            try:
+                await cb.answer(f"Error: {str(e)}", show_alert=True)
+            except:
+                pass
 
     @dp.callback_query(F.data.startswith("check:"))
     async def check_route(cb: CallbackQuery):
