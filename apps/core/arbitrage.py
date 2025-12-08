@@ -218,30 +218,32 @@ def _try_triangle(
     #    Price is base per Y
     y_to_base = d3["bid_price"]
     
-    # Apply fees
+    # Gross (before fees/slippage) using executable prices
+    gross_net = base_to_x * x_to_y * y_to_base
+    gross_profit_pct = (gross_net - 1.0) * 100.0
+    
+    # Fee-adjusted net (diagnostics)
     fee = (S.FEE_RATE_BPS + S.EXTRA_FEE_BPS) / 10000.0
     eff1 = base_to_x * (1 - fee)
     eff2 = x_to_y * (1 - fee)
     eff3 = y_to_base * (1 - fee)
-    
-    # Net multiplier for 1 unit of base
     net = eff1 * eff2 * eff3
-    profit_pct = (net - 1.0) * 100.0
+    net_profit_pct = (net - 1.0) * 100.0
     
-    # Track statistics
+    # Track statistics (store gross samples)
     if stats is not None:
         if len(stats.get("sample_profits", [])) < 100:
-            stats["sample_profits"].append(profit_pct)
+            stats["sample_profits"].append(gross_profit_pct)
     
-    # Check profit thresholds
+    # Check profit thresholds using GROSS profit
     min_prof = min_profit_pct if min_profit_pct is not None else S.MIN_PROFIT_PCT
     max_prof = max_profit_pct if max_profit_pct is not None else S.MAX_PROFIT_PCT
     
-    if profit_pct < min_prof or profit_pct > max_prof:
+    if gross_profit_pct < min_prof or gross_profit_pct > max_prof:
         if stats is not None:
             stats["filtered_profit"] = stats.get("filtered_profit", 0) + 1
         if random.random() < 0.01:
-            logger.debug(f"Route filtered by profit: {base}->{x}->{y}->{base} profit={profit_pct:.4f}%")
+            logger.debug(f"Route filtered by gross: {base}->{x}->{y}->{base} gross={gross_profit_pct:.4f}% (net={net_profit_pct:.4f}%)")
         return None
     
     # Capacity calculation
@@ -278,7 +280,7 @@ def _try_triangle(
         a=f"{x}/{base} buy",
         b=f"{y}/{x} buy",
         c=f"{y}/{base} sell",
-        profit_pct=round(profit_pct, 4),
+        profit_pct=round(gross_profit_pct, 4),
         volume_usd=round(max_base, 2),
     )
 
@@ -315,8 +317,8 @@ def find_candidate_routes(
         base = S.BASE_ASSET.upper()
         logger.info(f"Loaded {len(symbols)} symbols, base={base}, profit range: {min_profit_pct}% - {max_profit_pct}%")
         
-        # Dynamic universe
-        universe = _top_assets_by_quote_volume(client, symbols, base_quote=base, top_n=30)
+        # Dynamic universe - increased from 30 to 120
+        universe = _top_assets_by_quote_volume(client, symbols, base_quote=base, top_n=120)
         
         # Fallback if dynamic fails
         if not universe:
@@ -346,9 +348,9 @@ def find_candidate_routes(
         existing_symbols = [s for s in needed_symbols if s in symbols]
         logger.info(f"Pre-fetching depths for {len(existing_symbols)} unique symbols...")
         
-        # Step 2: Fetch depths in parallel
+        # Step 2: Fetch depths in parallel - reduced from 20 to 10 workers
         start_fetch = time.time()
-        depth_cache = _fetch_depth_parallel(client, existing_symbols, max_workers=20)
+        depth_cache = _fetch_depth_parallel(client, existing_symbols, max_workers=10)
         fetch_time = time.time() - start_fetch
         fetched_count = sum(1 for v in depth_cache.values() if v is not None)
         stats["symbols_fetched"] = fetched_count
