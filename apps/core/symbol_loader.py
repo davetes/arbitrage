@@ -1,6 +1,7 @@
 """
 FastSymbolLoader: Optimized symbol loading with caching and filtering
-Reduces 15.5MB download to ~5KB by filtering USDT pairs only and caching for 5 minutes
+Previously filtered to USDT pairs only; now supports bridge quotes (USDT, BTC, ETH, BNB, FDUSD, USDC)
+to enable triangular routes that require cross pairs like CFXBTC, ETHBTC, etc.
 """
 from typing import Dict, Optional
 from binance.spot import Spot as BinanceClient
@@ -12,7 +13,7 @@ logger = logging.getLogger(__name__)
 
 
 class FastSymbolLoader:
-    """Optimized symbol loader with caching and USDT filtering"""
+    """Optimized symbol loader with caching and bridge-quote filtering"""
     
     # Major trading pairs as fallback if API fails
     MAJOR_PAIRS = [
@@ -73,6 +74,8 @@ class FastSymbolLoader:
         base_upper = base_asset.upper()
         major_assets = {asset.upper() for asset in self.MAJOR_PAIRS}
         major_assets.add(base_upper)  # Include base asset
+        # Bridge quotes we want to keep to build triangles: include common quotes
+        bridge_quotes = {base_upper, "BTC", "ETH", "BNB", "FDUSD", "USDC"}
         
         for symbol_data in exchange_info.get("symbols", []):
             # Only include TRADING symbols
@@ -93,17 +96,9 @@ class FastSymbolLoader:
                         "status": symbol_data.get("status", "TRADING")
                     }
             else:
-                # Filter for pairs ending with base_asset (e.g., BTCUSDT, ETHUSDT)
-                # OR pairs where both assets are in major list (e.g., ETHBTC)
-                if symbol.endswith(base_upper):
-                    filtered[symbol] = {
-                        "symbol": symbol,
-                        "baseAsset": symbol_data.get("baseAsset", ""),
-                        "quoteAsset": symbol_data.get("quoteAsset", ""),
-                        "status": symbol_data.get("status", "TRADING")
-                    }
-                elif base_asset_symbol in major_assets and quote_asset_symbol in major_assets:
-                    # Include cross pairs like ETHBTC, BTCBNB, etc.
+                # Keep any pair whose quote is one of our bridge quotes
+                # This includes USDT pairs and cross pairs quoted in BTC/ETH/BNB/FDUSD/USDC
+                if quote_asset_symbol in bridge_quotes:
                     filtered[symbol] = {
                         "symbol": symbol,
                         "baseAsset": symbol_data.get("baseAsset", ""),
@@ -157,8 +152,8 @@ class FastSymbolLoader:
                 self._cache_timestamp = time.time()
                 
                 logger.info(
-                    f"Loaded {len(filtered)} {base_asset} pairs in {fetch_time:.2f}s "
-                    f"(filtered in {filter_time:.3f}s, cached for {self.cache_ttl}s)"
+                    f"Loaded {len(filtered)} symbols with quotes in { {'USDT','BTC','ETH','BNB','FDUSD','USDC'} } "
+                    f"in {fetch_time:.2f}s (filtered in {filter_time:.3f}s, cached for {self.cache_ttl}s)"
                 )
                 return filtered.copy()
                 
