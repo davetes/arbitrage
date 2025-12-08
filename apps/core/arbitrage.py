@@ -73,6 +73,54 @@ def _load_symbols(client: BinanceClient) -> Dict[str, dict]:
     return loader.load_symbols(client, base_asset=S.BASE_ASSET, use_cache=True)
 
 
+def _top_assets_by_quote_volume(
+    client: BinanceClient,
+    symbols: Dict[str, dict],
+    base_quote: str,
+    top_n: int = 100,
+) -> List[str]:
+    """Return a list of asset tickers (e.g., ["BTC","ETH",...]) ranked by 24h quoteVolume against the given base quote (e.g., USDT).
+
+    We consider symbols where quoteAsset == base_quote and status == TRADING, then sort by 24h quoteVolume (descending).
+    Falls back to an empty list if the endpoint fails.
+    """
+    try:
+        # Request 24h stats for all symbols once (heavy but single call)
+        stats = client.ticker_24hr()
+        # Map symbol -> quoteVolume
+        vol_map: Dict[str, float] = {}
+        for s in stats:
+            sym = s.get("symbol")
+            if not sym or sym not in symbols:
+                continue
+            info = symbols[sym]
+            if info.get("quoteAsset") != base_quote or info.get("status") != "TRADING":
+                continue
+            try:
+                vol_map[sym] = float(s.get("quoteVolume", 0))
+            except Exception:
+                continue
+
+        # Build (asset, volume) using the baseAsset of each symbol (e.g., BTCUSDT -> BTC)
+        ranked: List[Tuple[str, float]] = []
+        for sym, vol in vol_map.items():
+            asset = symbols[sym].get("baseAsset")
+            if asset and asset != base_quote:
+                ranked.append((asset, vol))
+
+        # Deduplicate by taking max volume per asset
+        by_asset: Dict[str, float] = {}
+        for asset, vol in ranked:
+            by_asset[asset] = max(vol, by_asset.get(asset, 0.0))
+
+        # Sort by volume desc and return top_n assets
+        top = sorted(by_asset.items(), key=lambda x: x[1], reverse=True)[:top_n]
+        return [a for a, _ in top]
+    except Exception:
+        # Fall back to empty to trigger static universe fallback
+        return []
+
+
 def _depth_snapshot(client: BinanceClient, symbol: str, depth: int = 20, use_cache: bool = True) -> Optional[dict]:
     """Get depth snapshot with caching and retries"""
     # Check cache first
@@ -545,6 +593,141 @@ def _try_triangle(
     )
 
 
+def _try_triangle_fixed(
+    client: BinanceClient,
+    symbols: Dict[str, dict],
+    base: str,
+    x: str,
+    y: str,
+    min_profit_pct: float = None,
+    max_profit_pct: float = None,
+    depth_cache: Dict[str, Optional[dict]] = None,
+    available_balance: float = None,
+) -> Optional[CandidateRoute]:
+    """
+    Fixed triangle detection that works with Binance's actual pair listings.
+    Tries several common pair direction patterns.
+    """
+
+    def get_depth(symbol: str) -> Optional[dict]:
+        if depth_cache is not None:
+            return depth_cache.get(symbol)
+        return _depth_snapshot(client, symbol, use_cache=True)
+
+    routes = []
+
+    # Pattern A: X/BASE → Y/X → BASE/Y
+    if f"{x}{base}" in symbols and f"{y}{x}" in symbols and f"{base}{y}" in symbols:
+        routes.append({
+            "pairs": [f"{x}{base}", f"{y}{x}", f"{base}{y}"],
+            "labels": [f"{x}/{base} buy", f"{y}/{x} buy", f"{base}/{y} sell"],
+            "conversions": [
+                lambda d: 1.0 / d["ask_price"],  # BASE→X
+                lambda d: 1.0 / d["ask_price"],  # X→Y
+                lambda d: d["bid_price"],        # Y→BASE
+            ],
+            "qty_refs": ["ask_qty", "ask_qty", "bid_qty"],
+        })
+
+    # Pattern B: X/BASE → X/Y → Y/BASE
+    if f"{x}{base}" in symbols and f"{x}{y}" in symbols and f"{y}{base}" in symbols:
+        routes.append({
+            "pairs": [f"{x}{base}", f"{x}{y}", f"{y}{base}"],
+            "labels": [f"{x}/{base} buy", f"{x}/{y} sell", f"{y}/{base} sell"],
+            "conversions": [
+                lambda d: 1.0 / d["ask_price"],  # BASE→X
+                lambda d: d["bid_price"],        # X→Y
+                lambda d: d["bid_price"],        # Y→BASE
+            ],
+            "qty_refs": ["ask_qty", "bid_qty", "bid_qty"],
+        })
+
+    # Pattern C: BASE/X → X/Y → Y/BASE
+    if f"{base}{x}" in symbols and f"{x}{y}" in symbols and f"{y}{base}" in symbols:
+        routes.append({
+            "pairs": [f"{base}{x}", f"{x}{y}", f"{y}{base}"],
+            "labels": [f"{base}/{x} sell", f"{x}/{y} sell", f"{y}/{base} sell"],
+            "conversions": [
+                lambda d: d["bid_price"],        # BASE→X (sell BASE for X)
+                lambda d: d["bid_price"],        # X→Y
+                lambda d: d["bid_price"],        # Y→BASE
+            ],
+            "qty_refs": ["bid_qty", "bid_qty", "bid_qty"],
+        })
+
+    best_route: Optional[CandidateRoute] = None
+    best_profit = -1e9
+
+    for route in routes:
+        depths: List[dict] = []
+        for pair in route["pairs"]:
+            d = get_depth(pair)
+            if not d:
+                break
+            depths.append(d)
+        else:
+            # Compute conversion rates
+            conv_rates: List[float] = []
+            for i, fn in enumerate(route["conversions"]):
+                conv_rates.append(fn(depths[i]))
+
+            # Apply fees from settings (set to 0 in settings for no-fee testing)
+            fee = (S.FEE_RATE_BPS + S.EXTRA_FEE_BPS) / 10000.0
+            eff1 = conv_rates[0] * (1 - fee)
+            eff2 = conv_rates[1] * (1 - fee)
+            eff3 = conv_rates[2] * (1 - fee)
+            net = eff1 * eff2 * eff3
+            profit_pct = (net - 1.0) * 100.0
+
+            # Profit bounds
+            min_prof = min_profit_pct if min_profit_pct is not None else S.MIN_PROFIT_PCT
+            max_prof = max_profit_pct if max_profit_pct is not None else S.MAX_PROFIT_PCT
+            if not (min_prof <= profit_pct <= max_prof):
+                continue
+
+            # Rough volume calc in BASE terms using available depths
+            try:
+                vol1 = depths[0][route["qty_refs"][0]] * depths[0]["ask_price"] if route["qty_refs"][0] == "ask_qty" else depths[0][route["qty_refs"][0]] * depths[0]["bid_price"]
+            except KeyError:
+                vol1 = 0.0
+            try:
+                # Convert leg2 qty to BASE using previous conversion
+                price_leg2 = depths[1]["ask_price"] if route["qty_refs"][1] == "ask_qty" else depths[1]["bid_price"]
+                qty_leg2 = depths[1][route["qty_refs"][1]]
+                # Approx in BASE by chaining with first conversion rate
+                vol2 = qty_leg2 * price_leg2
+            except KeyError:
+                vol2 = 0.0
+            try:
+                # Leg3 already quoted against BASE in common patterns
+                price_leg3 = depths[2]["bid_price"]
+                qty_leg3 = depths[2][route["qty_refs"][2]]
+                vol3 = qty_leg3 * price_leg3
+            except KeyError:
+                vol3 = 0.0
+
+            max_volume_usd = max(0.0, min(vol1, vol2, vol3))
+            if available_balance is not None and available_balance > 0:
+                max_volume_usd = min(available_balance, max_volume_usd, S.MAX_NOTIONAL_USD)
+            else:
+                max_volume_usd = min(max_volume_usd, S.MAX_NOTIONAL_USD)
+
+            if max_volume_usd < S.MIN_NOTIONAL_USD:
+                continue
+
+            candidate = CandidateRoute(
+                a=route["labels"][0],
+                b=route["labels"][1],
+                c=route["labels"][2],
+                profit_pct=round(profit_pct, 4),
+                volume_usd=round(max_volume_usd, 2),
+            )
+            if profit_pct > best_profit:
+                best_profit = profit_pct
+                best_route = candidate
+
+    return best_route
+
 def find_candidate_routes(
     *, 
     min_profit_pct: float, 
@@ -579,15 +762,19 @@ def find_candidate_routes(
         logger.info(f"Loaded {len(symbols)} symbols, filtering for profit: {min_profit_pct}% - {max_profit_pct}%")
         
         base = S.BASE_ASSET.upper()
-        # Expanded universe of popular trading pairs with good liquidity
-        universe = [
-            "BTC", "ETH", "BNB", "SOL", "ADA", "XRP", "DOGE", "MATIC", 
-            "AVAX", "DOT", "LINK", "UNI", "ATOM", "LTC", "ETC", "XLM",
-            "ALGO", "VET", "FIL", "TRX", "EOS", "AAVE", "SXP", "CHZ",
-            "BICO", "LISTA", "APT", "ARB", "OP", "SUI", "SEI", "TIA"
-        ]
+        # Dynamic universe: top assets by 24h quoteVolume against BASE
+        universe = _top_assets_by_quote_volume(client, symbols, base_quote=base, top_n=100)
         
-        # Filter out base asset from universe (we'll use it as starting point)
+        # Safe fallback to previous static universe if dynamic detection fails
+        if not universe:
+            universe = [
+                "BTC", "ETH", "BNB", "SOL", "ADA", "XRP", "DOGE", "MATIC", 
+                "AVAX", "DOT", "LINK", "UNI", "ATOM", "LTC", "ETC", "XLM",
+                "ALGO", "VET", "FIL", "TRX", "EOS", "AAVE", "SXP", "CHZ",
+                "BICO", "LISTA", "APT", "ARB", "OP", "SUI", "SEI", "TIA"
+            ]
+        
+        # Ensure BASE itself is not in the universe
         universe = [asset for asset in universe if asset != base]
         
         # Step 1: Collect all unique symbols needed for BASE-asset triangles only
@@ -630,9 +817,8 @@ def find_candidate_routes(
                 if y == z:
                     continue
                 checked += 1
-                # Use the specialized _try_triangle function for base-asset routes
-                # This ensures routes start and end with BASE (USDT)
-                r = _try_triangle(
+                # Use the fixed triangle detector matching Binance pair formats
+                r = _try_triangle_fixed(
                     client, symbols, base, y, z,
                     min_profit_pct, max_profit_pct,
                     depth_cache=depth_cache,
