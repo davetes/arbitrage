@@ -1,7 +1,10 @@
 from dataclasses import dataclass
 from typing import List, Optional, Dict, Tuple
 from binance.spot import Spot as BinanceClient
-from binance.websocket.spot.websocket_client import SpotWebsocketClient
+try:
+    from binance.websocket.spot.websocket_client import SpotWebsocketClient
+except Exception:  # Dependency may be missing in some deployments
+    SpotWebsocketClient = None
 from arbbot import settings as S
 from .symbol_loader import get_symbol_loader
 import time
@@ -81,6 +84,9 @@ class _BookTickerStream:
     def start(self, symbols: List[str], **kwargs):
         """Start bookTicker websocket for given symbols (idempotent)."""
         if self.running:
+            return
+        if SpotWebsocketClient is None:
+            logger.warning("SpotWebsocketClient unavailable; skipping websocket bookTicker startup.")
             return
         # Binance expects lowercase symbols for stream names.
         stream_symbols = [s.lower() for s in symbols]
@@ -469,8 +475,8 @@ def find_candidate_routes(
         existing_symbols = [s for s in needed_symbols if s in symbols]
         logger.info(f"Pre-fetching depths for {len(existing_symbols)} unique symbols...")
 
-        # Optional: start websocket bookTicker stream to reduce REST polling
-        use_ws = getattr(S, "USE_BOOK_TICKER_WS", True)
+        # Optional: start websocket bookTicker stream to reduce REST polling (only if dependency available)
+        use_ws = getattr(S, "USE_BOOK_TICKER_WS", True) and SpotWebsocketClient is not None
         if use_ws and existing_symbols:
             try:
                 stream_url = getattr(S, "BINANCE_WS_URL", None)
@@ -480,6 +486,8 @@ def find_candidate_routes(
             except Exception as e:
                 logger.warning(f"Failed to start bookTicker websocket, falling back to REST: {e}")
                 use_ws = False
+        elif getattr(S, "USE_BOOK_TICKER_WS", True) and SpotWebsocketClient is None:
+            logger.warning("USE_BOOK_TICKER_WS is True but SpotWebsocketClient is not installed; using REST depth only.")
         
         # Step 2: Fetch depths in parallel - reduced from 20 to 10 workers
         start_fetch = time.time()
