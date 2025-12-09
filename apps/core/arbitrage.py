@@ -156,9 +156,15 @@ def _client(timeout: int = None) -> BinanceClient:
 
 
 def _load_symbols(client: BinanceClient) -> Dict[str, dict]:
-    """Load symbols using FastSymbolLoader (cached, USDT-filtered)"""
+    """Load symbols using FastSymbolLoader (cached, optionally full universe)"""
     loader = get_symbol_loader(cache_ttl_seconds=300)
-    return loader.load_symbols(client, base_asset=S.BASE_ASSET, use_cache=True)
+    include_all_pairs = getattr(S, "LOAD_ALL_SYMBOLS", True)
+    return loader.load_symbols(
+        client,
+        base_asset=S.BASE_ASSET,
+        use_cache=True,
+        include_all_pairs=include_all_pairs,
+    )
 
 
 def _top_assets_by_quote_volume(
@@ -197,6 +203,45 @@ def _top_assets_by_quote_volume(
         return [a for a, _ in top]
     except Exception:
         return []
+
+
+def _top_assets_multi_quote(
+    client: BinanceClient,
+    symbols: Dict[str, dict],
+    quotes: List[str],
+    max_assets: int = 120,
+) -> List[str]:
+    """Rank assets by max 24h quoteVolume across multiple quote currencies."""
+    try:
+        stats = client.ticker_24hr()
+    except Exception:
+        return []
+
+    quotes_upper = {q.upper() for q in quotes}
+    vol_by_asset: Dict[str, float] = {}
+
+    for s in stats:
+        sym = s.get("symbol")
+        if not sym or sym not in symbols:
+            continue
+        info = symbols[sym]
+        if info.get("status") != "TRADING":
+            continue
+        quote = info.get("quoteAsset", "").upper()
+        if quote not in quotes_upper:
+            continue
+        base_asset = info.get("baseAsset", "").upper()
+        if not base_asset or base_asset == quote:
+            continue
+        try:
+            vol = float(s.get("quoteVolume", 0))
+        except Exception:
+            continue
+        # Keep max volume seen across quotes
+        vol_by_asset[base_asset] = max(vol_by_asset.get(base_asset, 0.0), vol)
+
+    top = sorted(vol_by_asset.items(), key=lambda x: x[1], reverse=True)[:max_assets]
+    return [a for a, _ in top]
 
 
 def _depth_snapshot(client: BinanceClient, symbol: str, depth: int = 20, use_cache: bool = True) -> Optional[dict]:
@@ -301,27 +346,101 @@ def _try_triangle(
     if not all([d1, d2, d3]):
         return None
     
-    # Calculate conversions using executable prices
-    # 1. base -> X: buy X at ask price (base per X), 1 base buys 1/ask X
-    base_to_x = 1.0 / d1["ask_price"]
-    
-    # 2. X -> Y: buy Y with X at ask price (X per Y), 1 X buys 1/ask Y
-    x_to_y = 1.0 / d2["ask_price"]
-    
-    # 3. Y -> base: sell Y at bid price (base per Y)
-    y_to_base = d3["bid_price"]
-    
-    # Gross (before fees/slippage) using executable prices
-    gross_net = base_to_x * x_to_y * y_to_base
-    gross_profit_pct = (gross_net - 1.0) * 100.0
-    
-    # Fee-adjusted net (diagnostics)
-    fee = (S.FEE_RATE_BPS + S.EXTRA_FEE_BPS) / 10000.0
-    eff1 = base_to_x * (1 - fee)
-    eff2 = x_to_y * (1 - fee)
-    eff3 = y_to_base * (1 - fee)
-    net = eff1 * eff2 * eff3
-    net_profit_pct = (net - 1.0) * 100.0
+    # Pattern evaluation: four permutations of BUY/SELL
+    patterns = [
+        ("BUY", "BUY", "SELL"),
+        ("BUY", "SELL", "SELL"),
+        ("SELL", "BUY", "BUY"),
+        ("SELL", "SELL", "BUY"),
+    ]
+
+    def trade_one(
+        amount: float,
+        current_asset: str,
+        base_asset: str,
+        quote_asset: str,
+        depth: dict,
+        desired_side: str,
+    ) -> Optional[Tuple[float, str, str, float]]:
+        """
+        Execute one leg, inverting if we hold the opposite asset.
+        Returns (new_amount, new_asset, executed_side, price_used)
+        """
+        side_upper = desired_side.upper()
+        if side_upper == "BUY":
+            if current_asset == quote_asset:
+                price = depth["ask_price"]
+                return amount / price, base_asset, "BUY", price
+            if current_asset == base_asset:
+                # Invert: sell base to acquire quote
+                price = depth["bid_price"]
+                return amount * price, quote_asset, "SELL(inv)", price
+        elif side_upper == "SELL":
+            if current_asset == base_asset:
+                price = depth["bid_price"]
+                return amount * price, quote_asset, "SELL", price
+            if current_asset == quote_asset:
+                # Invert: buy base using quote
+                price = depth["ask_price"]
+                return amount / price, base_asset, "BUY(inv)", price
+        return None
+
+    def evaluate_pattern(side_seq: Tuple[str, str, str]):
+        amt = 1.0
+        amt_net = 1.0
+        current = base
+        steps = []
+        executed_sides = []
+        fee = (S.FEE_RATE_BPS + S.EXTRA_FEE_BPS) / 10000.0
+
+        legs = [
+            (symbol1, x, base, d1),
+            (symbol2, y, x, d2),
+            (symbol3, y, base, d3),
+        ]
+
+        for (desired_side, (sym, leg_base, leg_quote, depth)) in zip(side_seq, legs):
+            res = trade_one(amt, current, leg_base, leg_quote, depth, desired_side)
+            if res is None:
+                return None
+            new_amt, new_asset, exec_side, price_used = res
+            # fee adjustment per leg
+            new_amt_net = new_amt * (1 - fee)
+            steps.append(f"{current}->{new_asset} via {sym} {exec_side} @ {price_used:.8f} | {amt:.10f}->{new_amt:.10f}")
+            executed_sides.append(exec_side)
+            amt = new_amt
+            amt_net = new_amt_net
+            current = new_asset
+
+        gross_profit_pct = (amt - 1.0) * 100.0
+        net_profit_pct = (amt_net - 1.0) * 100.0
+        return {
+            "gross_pct": gross_profit_pct,
+            "net_pct": net_profit_pct,
+            "amount": amt,
+            "amount_net": amt_net,
+            "steps": steps,
+            "sides": executed_sides,
+        }
+
+    best = None
+    best_pattern = None
+    for pat in patterns:
+        res = evaluate_pattern(pat)
+        if res is None:
+            continue
+        if best is None or res["gross_pct"] > best["gross_pct"]:
+            best = res
+            best_pattern = pat
+
+    if best is None:
+        return None
+
+    gross_profit_pct = best["gross_pct"]
+    net_profit_pct = best["net_pct"]
+    gross_net = best["amount"]
+    steps_trace = best["steps"]
+    executed_sides = best["sides"]
     
     # Track statistics (store gross samples)
     if stats is not None:
@@ -338,6 +457,11 @@ def _try_triangle(
         if random.random() < 0.01:
             logger.debug(f"Route filtered by gross: {base}->{x}->{y}->{base} gross={gross_profit_pct:.4f}% (net={net_profit_pct:.4f}%)")
         return None
+    
+    # Baseline conversions for capacity approximation
+    base_to_x = 1.0 / d1["ask_price"] if d1["ask_price"] else 0
+    x_to_y = 1.0 / d2["ask_price"] if d2["ask_price"] else 0
+    y_to_base = d3["bid_price"]
     
     # Capacity calculation
     # Leg 1: base -> X (buy X with base)
@@ -369,10 +493,13 @@ def _try_triangle(
             logger.debug(f"Route filtered by volume: {base}->{x}->{y}->{base} volume=${max_base:.2f}")
         return None
     
+    def _side_label(s: str) -> str:
+        return "sell" if s.upper().startswith("SELL") else "buy"
+
     route = CandidateRoute(
-        a=f"{x}/{base} buy",
-        b=f"{y}/{x} buy",
-        c=f"{y}/{base} sell",
+        a=f"{x}/{base} {_side_label(executed_sides[0])}",
+        b=f"{y}/{x} {_side_label(executed_sides[1])}",
+        c=f"{y}/{base} {_side_label(executed_sides[2])}",
         profit_pct=round(gross_profit_pct, 4),
         volume_usd=round(max_base, 2),
     )
@@ -380,33 +507,28 @@ def _try_triangle(
     # Detailed trace for correctness verification (toggle via S.LOG_ARBITRAGE_STEPS)
     if getattr(S, "LOG_ARBITRAGE_STEPS", False):
         logger.info(
-            (
-                "arb-trace base=%s path=%s/%s/%s | "
-                "leg1 %s BUY @ ask=%.8f -> %.8f %s | "
-                "leg2 %s BUY @ ask=%.8f -> %.8f %s | "
-                "leg3 %s SELL @ bid=%.8f -> %.8f %s | "
-                "gross=%.6f%% net=%.6f%% vol=$%.2f"
-            ),
-            base, x, y, base,
-            f"{x}/{base}", d1["ask_price"], base_to_x, x,
-            f"{y}/{x}", d2["ask_price"], base_to_x * x_to_y, y,
-            f"{y}/{base}", d3["bid_price"], gross_net, base,
-            gross_profit_pct, net_profit_pct, max_base,
+            "arb-trace pattern=%s base=%s path=%s/%s/%s gross=%.6f%% net=%.6f%% vol=$%.2f steps=%s",
+            "-".join(best_pattern),
+            base,
+            x,
+            y,
+            base,
+            gross_profit_pct,
+            net_profit_pct,
+            max_base,
+            " || ".join(steps_trace),
         )
     else:
         logger.debug(
-            (
-                "triangle %s->%s->%s->%s | "
-                "prices: [%s ask=%.8f] [%s ask=%.8f] [%s bid=%.8f] | "
-                "steps: base->x=%.8f x->y=%.8f y->base=%.8f | "
-                "gross=%.6f%% net=%.6f%% vol=$%.2f"
-            ),
-            base, x, y, base,
-            symbol1, d1["ask_price"],
-            symbol2, d2["ask_price"],
-            symbol3, d3["bid_price"],
-            base_to_x, x_to_y, y_to_base,
-            gross_profit_pct, net_profit_pct, max_base,
+            "triangle %s->%s->%s->%s pattern=%s gross=%.6f%% net=%.6f%% vol=$%.2f",
+            base,
+            x,
+            y,
+            base,
+            "-".join(best_pattern),
+            gross_profit_pct,
+            net_profit_pct,
+            max_base,
         )
 
     return route
@@ -442,17 +564,30 @@ def find_candidate_routes(
         stats["symbols_loaded"] = len(symbols)
         
         base = S.BASE_ASSET.upper()
-        logger.info(f"Loaded {len(symbols)} symbols, base={base}, profit range: {min_profit_pct}% - {max_profit_pct}%")
+        allowed_quotes = getattr(S, "ALLOWED_QUOTES", ["USDT", "BTC", "ETH", "BNB", "FDUSD", "USDC"])
+        if base not in allowed_quotes:
+            allowed_quotes.append(base)
+        max_assets = getattr(S, "MAX_ASSETS", 120)
+        logger.info(
+            f"Loaded {len(symbols)} symbols, base={base}, profit range: {min_profit_pct}% - {max_profit_pct}%, "
+            f"quotes={allowed_quotes}, max_assets={max_assets}"
+        )
         
-        # Dynamic universe - increased from 30 to 120
-        universe = _top_assets_by_quote_volume(client, symbols, base_quote=base, top_n=120)
+        # Dynamic universe across multiple quotes
+        universe = _top_assets_multi_quote(client, symbols, quotes=allowed_quotes, max_assets=max_assets)
         
         # Fallback if dynamic fails
         if not universe:
-            universe = ["BTC", "ETH", "BNB", "SOL", "ADA", "XRP", "DOGE", "MATIC"]
+            universe = [
+                "BTC", "ETH", "BNB", "SOL", "ADA", "XRP", "DOGE", "MATIC",
+                "AVAX", "DOT", "LINK", "UNI", "ATOM", "LTC", "ETC", "XLM",
+                "ALGO", "VET", "FIL", "TRX", "EOS", "AAVE", "SXP", "CHZ",
+                "BICO", "LISTA", "APT", "ARB", "OP", "SUI", "SEI", "TIA",
+                "SHIB", "PEPE", "WIF", "ORDI", "TIA", "INJ", "FTM", "RUNE",
+            ]
         
-        universe = [asset for asset in universe if asset != base]
-        logger.info(f"Using {len(universe)} assets: {universe[:10]}...")
+        universe = [asset for asset in universe if asset != base][:max_assets]
+        logger.info(f"Using {len(universe)} assets: {universe[:15]}...")
         
         # Step 1: Collect symbols needed for triangles
         # For triangle base -> X -> Y -> base, we need:

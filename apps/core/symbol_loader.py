@@ -87,14 +87,13 @@ class FastSymbolLoader:
             quote_asset_symbol = symbol_data.get("quoteAsset", "").upper()
             
             if include_all_pairs:
-                # Include all pairs where at least one asset is in our major list
-                if base_asset_symbol in major_assets or quote_asset_symbol in major_assets:
-                    filtered[symbol] = {
-                        "symbol": symbol,
-                        "baseAsset": symbol_data.get("baseAsset", ""),
-                        "quoteAsset": symbol_data.get("quoteAsset", ""),
-                        "status": symbol_data.get("status", "TRADING")
-                    }
+                # Include all trading pairs (status already checked)
+                filtered[symbol] = {
+                    "symbol": symbol,
+                    "baseAsset": symbol_data.get("baseAsset", ""),
+                    "quoteAsset": symbol_data.get("quoteAsset", ""),
+                    "status": symbol_data.get("status", "TRADING")
+                }
             else:
                 # Keep any pair whose quote is one of our bridge quotes
                 # This includes USDT pairs and cross pairs quoted in BTC/ETH/BNB/FDUSD/USDC
@@ -112,7 +111,8 @@ class FastSymbolLoader:
         self, 
         client: BinanceClient, 
         base_asset: str = "USDT",
-        use_cache: bool = True
+        use_cache: bool = True,
+        include_all_pairs: bool = False,
     ) -> Dict[str, dict]:
         """
         Load symbols with caching and USDT filtering
@@ -144,7 +144,7 @@ class FastSymbolLoader:
                 fetch_time = time.time() - start_time
                 
                 # Filter and extract USDT pairs + cross pairs (e.g., ETHBTC)
-                filtered = self._filter_and_extract(exchange_info, base_asset, include_all_pairs=False)
+                filtered = self._filter_and_extract(exchange_info, base_asset, include_all_pairs=include_all_pairs)
                 filter_time = time.time() - start_time - fetch_time
                 
                 # Update cache
