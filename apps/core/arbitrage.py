@@ -1,11 +1,14 @@
 from dataclasses import dataclass
 from typing import List, Optional, Dict, Tuple
 from binance.spot import Spot as BinanceClient
+from binance.websocket.spot.websocket_client import SpotWebsocketClient
 from arbbot import settings as S
 from .symbol_loader import get_symbol_loader
 import time
 import logging
 import random
+import threading
+import json
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 logger = logging.getLogger(__name__)
@@ -40,6 +43,76 @@ class DepthCache:
 _depth_cache = DepthCache(ttl_seconds=2.0)
 
 
+class _BookTickerStream:
+    """Websocket-based best bid/ask cache."""
+
+    def __init__(self, ttl_seconds: float = 2.0):
+        self.ttl = ttl_seconds
+        self.client: Optional[SpotWebsocketClient] = None
+        self.lock = threading.Lock()
+        self.cache: Dict[str, Tuple[dict, float]] = {}
+        self.running = False
+
+    def _on_message(self, _, message: str):
+        try:
+            data = json.loads(message)
+            if not isinstance(data, dict):
+                return
+            symbol = data.get("s") or data.get("symbol")
+            bid_price = float(data.get("b"))
+            bid_qty = float(data.get("B"))
+            ask_price = float(data.get("a"))
+            ask_qty = float(data.get("A"))
+            snapshot = {
+                "ask_price": ask_price,
+                "ask_qty": ask_qty,
+                "bid_price": bid_price,
+                "bid_qty": bid_qty,
+                "total_ask_qty": ask_qty,
+                "total_bid_qty": bid_qty,
+                "cap_ask_quote": ask_price * ask_qty,
+                "cap_bid_quote": bid_price * bid_qty,
+            }
+            with self.lock:
+                self.cache[symbol.upper()] = (snapshot, time.time())
+        except Exception:
+            return
+
+    def start(self, symbols: List[str], **kwargs):
+        """Start bookTicker websocket for given symbols (idempotent)."""
+        if self.running:
+            return
+        # Binance expects lowercase symbols for stream names.
+        stream_symbols = [s.lower() for s in symbols]
+        self.client = SpotWebsocketClient(on_message=self._on_message, **kwargs)
+        self.client.start()
+        for sym in stream_symbols:
+            self.client.book_ticker(symbol=sym)
+        self.running = True
+
+    def stop(self):
+        if self.client:
+            try:
+                self.client.stop()
+            except Exception:
+                pass
+        self.running = False
+
+    def get(self, symbol: str) -> Optional[dict]:
+        now = time.time()
+        with self.lock:
+            if symbol.upper() in self.cache:
+                data, ts = self.cache[symbol.upper()]
+                if now - ts < self.ttl:
+                    return data
+                else:
+                    del self.cache[symbol.upper()]
+        return None
+
+
+_book_ticker_stream = _BookTickerStream(ttl_seconds=2.0)
+
+
 @dataclass
 class CandidateRoute:
     a: str  # leg1 label e.g., "BTC/USDT buy"
@@ -47,6 +120,18 @@ class CandidateRoute:
     c: str  # leg3 label e.g., "ETH/USDT sell"
     profit_pct: float
     volume_usd: float
+
+
+@dataclass
+class TriangularArbResult:
+    forward_profit_pct: float
+    backward_profit_pct: float
+    best_path: str
+    best_profit_pct: float
+    pattern: str
+    forward_steps: List[str]
+    backward_steps: List[str]
+    warnings: List[str]
 
 
 def _client(timeout: int = None) -> BinanceClient:
@@ -109,7 +194,12 @@ def _top_assets_by_quote_volume(
 
 
 def _depth_snapshot(client: BinanceClient, symbol: str, depth: int = 20, use_cache: bool = True) -> Optional[dict]:
-    """Get depth snapshot with caching and retries"""
+    """Get depth snapshot from websocket cache first, then REST with caching and retries."""
+    # Try websocket bookTicker cache first
+    ws_data = _book_ticker_stream.get(symbol)
+    if ws_data:
+        return ws_data
+
     if use_cache:
         cached = _depth_cache.get(symbol)
         if cached is not None:
@@ -205,17 +295,14 @@ def _try_triangle(
     if not all([d1, d2, d3]):
         return None
     
-    # Calculate conversions:
-    # 1. base -> X: buy X at ask price
-    #    Price is base per X, so 1 base buys 1/price X
+    # Calculate conversions using executable prices
+    # 1. base -> X: buy X at ask price (base per X), 1 base buys 1/ask X
     base_to_x = 1.0 / d1["ask_price"]
     
-    # 2. X -> Y: buy Y with X at ask price
-    #    Price is X per Y, so 1 X buys 1/price Y
+    # 2. X -> Y: buy Y with X at ask price (X per Y), 1 X buys 1/ask Y
     x_to_y = 1.0 / d2["ask_price"]
     
-    # 3. Y -> base: sell Y at bid price
-    #    Price is base per Y
+    # 3. Y -> base: sell Y at bid price (base per Y)
     y_to_base = d3["bid_price"]
     
     # Gross (before fees/slippage) using executable prices
@@ -276,13 +363,47 @@ def _try_triangle(
             logger.debug(f"Route filtered by volume: {base}->{x}->{y}->{base} volume=${max_base:.2f}")
         return None
     
-    return CandidateRoute(
+    route = CandidateRoute(
         a=f"{x}/{base} buy",
         b=f"{y}/{x} buy",
         c=f"{y}/{base} sell",
         profit_pct=round(gross_profit_pct, 4),
         volume_usd=round(max_base, 2),
     )
+
+    # Detailed trace for correctness verification (toggle via S.LOG_ARBITRAGE_STEPS)
+    if getattr(S, "LOG_ARBITRAGE_STEPS", False):
+        logger.info(
+            (
+                "arb-trace base=%s path=%s/%s/%s | "
+                "leg1 %s BUY @ ask=%.8f -> %.8f %s | "
+                "leg2 %s BUY @ ask=%.8f -> %.8f %s | "
+                "leg3 %s SELL @ bid=%.8f -> %.8f %s | "
+                "gross=%.6f%% net=%.6f%% vol=$%.2f"
+            ),
+            base, x, y, base,
+            f"{x}/{base}", d1["ask_price"], base_to_x, x,
+            f"{y}/{x}", d2["ask_price"], base_to_x * x_to_y, y,
+            f"{y}/{base}", d3["bid_price"], gross_net, base,
+            gross_profit_pct, net_profit_pct, max_base,
+        )
+    else:
+        logger.debug(
+            (
+                "triangle %s->%s->%s->%s | "
+                "prices: [%s ask=%.8f] [%s ask=%.8f] [%s bid=%.8f] | "
+                "steps: base->x=%.8f x->y=%.8f y->base=%.8f | "
+                "gross=%.6f%% net=%.6f%% vol=$%.2f"
+            ),
+            base, x, y, base,
+            symbol1, d1["ask_price"],
+            symbol2, d2["ask_price"],
+            symbol3, d3["bid_price"],
+            base_to_x, x_to_y, y_to_base,
+            gross_profit_pct, net_profit_pct, max_base,
+        )
+
+    return route
 
 
 def find_candidate_routes(
@@ -347,6 +468,18 @@ def find_candidate_routes(
         # Filter to existing symbols
         existing_symbols = [s for s in needed_symbols if s in symbols]
         logger.info(f"Pre-fetching depths for {len(existing_symbols)} unique symbols...")
+
+        # Optional: start websocket bookTicker stream to reduce REST polling
+        use_ws = getattr(S, "USE_BOOK_TICKER_WS", True)
+        if use_ws and existing_symbols:
+            try:
+                stream_url = getattr(S, "BINANCE_WS_URL", None)
+                kwargs = {"stream_url": stream_url} if stream_url else {}
+                _book_ticker_stream.start(existing_symbols, **kwargs)
+                logger.info(f"Started bookTicker websocket for {len(existing_symbols)} symbols")
+            except Exception as e:
+                logger.warning(f"Failed to start bookTicker websocket, falling back to REST: {e}")
+                use_ws = False
         
         # Step 2: Fetch depths in parallel - reduced from 20 to 10 workers
         start_fetch = time.time()
@@ -482,3 +615,129 @@ def debug_specific_triangles():
                 print(f"  Result: No route found (check depth data)")
         else:
             print(f"  Result: Missing pairs")
+
+
+def _apply_leg(amount: float, base: str, quote: str, price: float, side: str) -> Tuple[float, str]:
+    """
+    Apply one trade leg using BUY/SELL semantics.
+    BUY: spend quote to receive base (amount / price)
+    SELL: spend base to receive quote (amount * price)
+    """
+    side_upper = side.upper()
+    next_asset = base if side_upper == "BUY" else quote
+    new_amount = amount / price if side_upper == "BUY" else amount * price
+    return new_amount, next_asset
+
+
+def _parse_pair(raw: str) -> Tuple[str, str, float, str]:
+    """Parse input like 'BNB/USDT: 921.69 BUY'"""
+    parts = raw.replace(",", " ").split()
+    if len(parts) < 3:
+        raise ValueError(f"Cannot parse pair input: '{raw}'")
+    pair = parts[0].rstrip(":")
+    price = float(parts[1])
+    side = parts[2].upper()
+    if "/" not in pair:
+        raise ValueError(f"Pair must contain '/': '{pair}'")
+    base, quote = pair.split("/")
+    return base.upper(), quote.upper(), price, side
+
+
+def _invert_pair(base: str, quote: str, price: float, side: str) -> Tuple[str, str, float, str]:
+    """Invert a pair: flip assets, invert price, flip side."""
+    inv_price = 1.0 / price
+    inv_side = "BUY" if side.upper() == "SELL" else "SELL"
+    return quote, base, inv_price, inv_side
+
+
+def _describe_step(src_asset: str, dst_asset: str, price: float, side: str, amount_before: float, amount_after: float) -> str:
+    """Human-friendly step description."""
+    return f"{src_asset} -> {dst_asset}: {side.upper()} @ {price:.10f} | {amount_before:.10f} -> {amount_after:.10f}"
+
+
+def calculate_triangular_arbitrage(pair1: str, pair2: str, pair3: str) -> TriangularArbResult:
+    """
+    Calculate forward and backward triangular arbitrage profit for three pairs.
+    Input format per leg: 'ASSETX/ASSETY: price SIDE'
+
+    Forward path: pair1 -> pair2 -> pair3
+    Backward path: pair3 -> inverse(pair2) -> inverse(pair1)
+    """
+    warnings: List[str] = []
+
+    b1, q1, p1, s1 = _parse_pair(pair1)
+    b2, q2, p2, s2 = _parse_pair(pair2)
+    b3, q3, p3, s3 = _parse_pair(pair3)
+
+    asset1 = q1  # start asset (quote of first pair, typically USDT)
+    asset2 = b1
+    asset3 = b2
+
+    # Chain validation for forward path
+    if q2 != asset2:
+        warnings.append(f"Chain mismatch: pair2 quote {q2} should be {asset2}")
+    if b3 != asset3 or q3 != asset1:
+        warnings.append(f"Chain mismatch: pair3 expected {asset3}/{asset1}, got {b3}/{q3}")
+
+    pattern = f"{s1.upper()}-{s2.upper()}-{s3.upper()}"
+
+    def run_path(legs: List[Tuple[str, str, float, str]]) -> Tuple[float, List[str]]:
+        amt = 1.0
+        current_asset = asset1
+        steps: List[str] = []
+        for base, quote, price, side in legs:
+            amt_before = amt
+            side_upper = side.upper()
+            if side_upper == "BUY" and current_asset != quote:
+                warnings.append(f"Expected to spend {quote} but have {current_asset}; using leg as-is.")
+            if side_upper == "SELL" and current_asset != base:
+                warnings.append(f"Expected to spend {base} but have {current_asset}; using leg as-is.")
+            amt, new_asset = _apply_leg(amt, base, quote, price, side)
+            steps.append(_describe_step(current_asset, new_asset, price, side, amt_before, amt))
+            current_asset = new_asset
+        return amt, steps
+
+    # Forward: given order
+    forward_amount, forward_steps = run_path([
+        (b1, q1, p1, s1),
+        (b2, q2, p2, s2),
+        (b3, q3, p3, s3),
+    ])
+    forward_profit = (forward_amount - 1.0) * 100.0
+
+    # Backward: pair3 -> inverse(pair2) -> inverse(pair1)
+    inv_b2, inv_q2, inv_p2, inv_s2 = _invert_pair(b2, q2, p2, s2)
+    inv_b1, inv_q1, inv_p1, inv_s1 = _invert_pair(b1, q1, p1, s1)
+    backward_amount, backward_steps = run_path([
+        (b3, q3, p3, s3),
+        (inv_b2, inv_q2, inv_p2, inv_s2),
+        (inv_b1, inv_q1, inv_p1, inv_s1),
+    ])
+    backward_profit = (backward_amount - 1.0) * 100.0
+
+    best_path = "Forward" if forward_profit >= backward_profit else "Backward"
+    best_profit = forward_profit if best_path == "Forward" else backward_profit
+
+    if getattr(S, "LOG_ARBITRAGE_STEPS", False):
+        logger.info(
+            "tri-calc pattern=%s forward=%.6f%% backward=%.6f%% best=%s(%.6f%%) warnings=%s",
+            pattern,
+            forward_profit,
+            backward_profit,
+            best_path.lower(),
+            best_profit,
+            "; ".join(warnings) if warnings else "none",
+        )
+        logger.info("tri-calc forward steps: %s", " || ".join(forward_steps))
+        logger.info("tri-calc backward steps: %s", " || ".join(backward_steps))
+
+    return TriangularArbResult(
+        forward_profit_pct=round(forward_profit, 4),
+        backward_profit_pct=round(backward_profit, 4),
+        best_path=best_path,
+        best_profit_pct=round(best_profit, 4),
+        pattern=pattern,
+        forward_steps=forward_steps,
+        backward_steps=backward_steps,
+        warnings=warnings,
+    )
