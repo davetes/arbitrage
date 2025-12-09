@@ -327,105 +327,107 @@ def _try_triangle(
     
     # We need these 3 symbols:
     # 1. X/base (e.g., BTCUSDT) - buy X with base
-    # 2. Y/X (e.g., ETHBTC) - buy Y with X
+    # 2. Y/X (e.g., ETHBTC) - buy Y with X (or inverse if only XY exists)
     # 3. Y/base (e.g., ETHUSDT) - sell Y for base
     
     symbol1 = f"{x}{base}"  # Xbase (e.g., BTCUSDT)
-    symbol2 = f"{y}{x}"     # YX (e.g., ETHBTC)
+    symbol2 = f"{y}{x}"     # YX preferred (e.g., ETHBTC)
+    symbol2_alt = f"{x}{y}" # XY fallback (e.g., BTCETH)
     symbol3 = f"{y}{base}"  # Ybase (e.g., ETHUSDT)
     
     # Check all symbols exist
-    if not (symbol1 in symbols and symbol2 in symbols and symbol3 in symbols):
+    if symbol1 not in symbols or symbol3 not in symbols:
         return None
     
     # Get depths
     d1 = get_depth(symbol1)
-    d2 = get_depth(symbol2)
+    d2 = None
+    inverted_cross = False
+    if symbol2 in symbols:
+        d2 = get_depth(symbol2)
+    elif symbol2_alt in symbols:
+        # Use inverted depth from XY
+        orig = get_depth(symbol2_alt)
+        if orig:
+            # Invert bids/asks: price flips, bids become asks
+            try:
+                inv_ask = 1.0 / orig["bid_price"] if orig["bid_price"] else None
+                inv_bid = 1.0 / orig["ask_price"] if orig["ask_price"] else None
+            except Exception:
+                inv_ask = inv_bid = None
+            if inv_ask and inv_bid:
+                d2 = {
+                    "ask_price": inv_ask,
+                    "bid_price": inv_bid,
+                    # quantities not used in theoretical mode; keep placeholders
+                    "ask_qty": orig.get("bid_qty", 0),
+                    "bid_qty": orig.get("ask_qty", 0),
+                    "total_ask_qty": orig.get("total_bid_qty", 0),
+                    "total_bid_qty": orig.get("total_ask_qty", 0),
+                    "cap_ask_quote": 0,
+                    "cap_bid_quote": 0,
+                }
+                inverted_cross = True
     d3 = get_depth(symbol3)
     
     if not all([d1, d2, d3]):
         return None
     
-    # Pattern evaluation: four permutations of BUY/SELL
-    patterns = [
-        ("BUY", "BUY", "SELL"),
-        ("BUY", "SELL", "SELL"),
-        ("SELL", "BUY", "BUY"),
-        ("SELL", "SELL", "BUY"),
-    ]
+    # Pattern evaluation: four permutations of BUY/SELL using direct bid/ask math
+    patterns = {
+        ("BUY", "BUY", "SELL"): [
+            ("ask", symbol1, d1, "BUY"),
+            ("ask", symbol2 if not inverted_cross else symbol2_alt, d2, "BUY"),
+            ("bid", symbol3, d3, "SELL"),
+        ],
+        ("BUY", "SELL", "SELL"): [
+            ("ask", symbol1, d1, "BUY"),
+            ("bid", symbol2 if not inverted_cross else symbol2_alt, d2, "SELL"),
+            ("bid", symbol3, d3, "SELL"),
+        ],
+        ("SELL", "BUY", "BUY"): [
+            ("bid", symbol1, d1, "SELL"),
+            ("ask", symbol2 if not inverted_cross else symbol2_alt, d2, "BUY"),
+            ("ask", symbol3, d3, "BUY"),
+        ],
+        ("SELL", "SELL", "BUY"): [
+            ("bid", symbol1, d1, "SELL"),
+            ("bid", symbol2 if not inverted_cross else symbol2_alt, d2, "SELL"),
+            ("ask", symbol3, d3, "BUY"),
+        ],
+    }
 
-    def trade_one(
-        amount: float,
-        current_asset: str,
-        base_asset: str,
-        quote_asset: str,
-        depth: dict,
-        desired_side: str,
-    ) -> Optional[Tuple[float, str, str, float]]:
-        """
-        Execute one leg, inverting if we hold the opposite asset.
-        Returns (new_amount, new_asset, executed_side, price_used)
-        """
-        side_upper = desired_side.upper()
-        if side_upper == "BUY":
-            if current_asset == quote_asset:
-                price = depth["ask_price"]
-                return amount / price, base_asset, "BUY", price
-            if current_asset == base_asset:
-                # Invert: sell base to acquire quote
-                price = depth["bid_price"]
-                return amount * price, quote_asset, "SELL(inv)", price
-        elif side_upper == "SELL":
-            if current_asset == base_asset:
-                price = depth["bid_price"]
-                return amount * price, quote_asset, "SELL", price
-            if current_asset == quote_asset:
-                # Invert: buy base using quote
-                price = depth["ask_price"]
-                return amount / price, base_asset, "BUY(inv)", price
-        return None
-
-    def evaluate_pattern(side_seq: Tuple[str, str, str]):
+    def evaluate_pattern(pat: Tuple[str, str, str]):
         amt = 1.0
-        amt_net = 1.0
-        current = base
         steps = []
-        executed_sides = []
         fee = (S.FEE_RATE_BPS + S.EXTRA_FEE_BPS) / 10000.0
+        legs = patterns[pat]
+        executed_sides = []
 
-        legs = [
-            (symbol1, x, base, d1),
-            (symbol2, y, x, d2),
-            (symbol3, y, base, d3),
-        ]
-
-        for (desired_side, (sym, leg_base, leg_quote, depth)) in zip(side_seq, legs):
-            res = trade_one(amt, current, leg_base, leg_quote, depth, desired_side)
-            if res is None:
+        for (side_price, sym, depth, logical_side) in legs:
+            price = depth["ask_price"] if side_price == "ask" else depth["bid_price"]
+            if price <= 0:
                 return None
-            new_amt, new_asset, exec_side, price_used = res
-            # fee adjustment per leg
-            new_amt_net = new_amt * (1 - fee)
-            steps.append(f"{current}->{new_asset} via {sym} {exec_side} @ {price_used:.8f} | {amt:.10f}->{new_amt:.10f}")
-            executed_sides.append(exec_side)
-            amt = new_amt
-            amt_net = new_amt_net
-            current = new_asset
+            amt_before = amt
+            if logical_side == "BUY":
+                amt = amt / price
+            else:
+                amt = amt * price
+            amt_net = amt * (1 - fee)
+            steps.append(f"{logical_side} {sym} @{price:.10f} | {amt_before:.10f}->{amt:.10f}")
+            executed_sides.append(logical_side.lower())
+            amt = amt_net  # carry forward fee-adjusted amount
 
         gross_profit_pct = (amt - 1.0) * 100.0
-        net_profit_pct = (amt_net - 1.0) * 100.0
         return {
             "gross_pct": gross_profit_pct,
-            "net_pct": net_profit_pct,
-            "amount": amt,
-            "amount_net": amt_net,
             "steps": steps,
             "sides": executed_sides,
         }
 
     best = None
     best_pattern = None
-    for pat in patterns:
+    for pat in patterns.keys():
         res = evaluate_pattern(pat)
         if res is None:
             continue
@@ -437,8 +439,8 @@ def _try_triangle(
         return None
 
     gross_profit_pct = best["gross_pct"]
-    net_profit_pct = best["net_pct"]
-    gross_net = best["amount"]
+    net_profit_pct = gross_profit_pct  # fees already applied per leg into amt
+    gross_net = (1 + gross_profit_pct / 100.0)
     steps_trace = best["steps"]
     executed_sides = best["sides"]
     
@@ -448,7 +450,7 @@ def _try_triangle(
             stats["sample_profits"].append(gross_profit_pct)
     
     # Check profit thresholds using GROSS profit
-    min_prof = min_profit_pct if min_profit_pct is not None else S.MIN_PROFIT_PCT
+    min_prof = min_profit_pct if min_profit_pct is not None else getattr(S, "MIN_PROFIT_PCT", 1.0)
     max_prof = max_profit_pct if max_profit_pct is not None else S.MAX_PROFIT_PCT
     
     if gross_profit_pct < min_prof or gross_profit_pct > max_prof:
@@ -458,40 +460,33 @@ def _try_triangle(
             logger.debug(f"Route filtered by gross: {base}->{x}->{y}->{base} gross={gross_profit_pct:.4f}% (net={net_profit_pct:.4f}%)")
         return None
     
-    # Baseline conversions for capacity approximation
-    base_to_x = 1.0 / d1["ask_price"] if d1["ask_price"] else 0
-    x_to_y = 1.0 / d2["ask_price"] if d2["ask_price"] else 0
-    y_to_base = d3["bid_price"]
-    
-    # Capacity calculation
-    # Leg 1: base -> X (buy X with base)
-    # cap_ask_quote is base needed to buy all asks
-    cap1_base = d1["cap_ask_quote"]
-    
-    # Leg 2: X -> Y (buy Y with X)
-    # cap_ask_quote is in X terms (since X is quote in Y/X)
-    # Convert to base: X_amount * (base per X) = X_amount / base_to_x
-    cap2_base = d2["cap_ask_quote"] / base_to_x if base_to_x > 0 else 0
-    
-    # Leg 3: Y -> base (sell Y for base)
-    # total_bid_qty is Y amount, convert to base
-    cap3_base = d3["total_bid_qty"] * y_to_base
-    
-    # Maximum executable base amount
-    max_base = min(cap1_base, cap2_base, cap3_base)
-    
-    # Apply balance and limits
-    if available_balance is not None and available_balance > 0:
-        max_base = min(max_base, available_balance)
-    
-    max_base = min(max_base, S.MAX_NOTIONAL_USD)
-    
-    if max_base < S.MIN_NOTIONAL_USD:
-        if stats is not None:
-            stats["filtered_volume"] = stats.get("filtered_volume", 0) + 1
-        if random.random() < 0.01:
-            logger.debug(f"Route filtered by volume: {base}->{x}->{y}->{base} volume=${max_base:.2f}")
-        return None
+    # In theoretical mode, skip capacity and notional checks
+    theoretical = getattr(S, "THEORETICAL_MODE", True)
+    if theoretical:
+        max_base = S.MAX_NOTIONAL_USD
+    else:
+        # Baseline conversions for capacity approximation
+        base_to_x = 1.0 / d1["ask_price"] if d1["ask_price"] else 0
+        x_to_y = 1.0 / d2["ask_price"] if d2["ask_price"] else 0
+        y_to_base = d3["bid_price"]
+        
+        # Capacity calculation
+        cap1_base = d1["cap_ask_quote"]
+        cap2_base = d2["cap_ask_quote"] / base_to_x if base_to_x > 0 else 0
+        cap3_base = d3["total_bid_qty"] * y_to_base
+        max_base = min(cap1_base, cap2_base, cap3_base)
+        
+        if available_balance is not None and available_balance > 0:
+            max_base = min(max_base, available_balance)
+        
+        max_base = min(max_base, S.MAX_NOTIONAL_USD)
+        
+        if max_base < S.MIN_NOTIONAL_USD:
+            if stats is not None:
+                stats["filtered_volume"] = stats.get("filtered_volume", 0) + 1
+            if random.random() < 0.01:
+                logger.debug(f"Route filtered by volume: {base}->{x}->{y}->{base} volume=${max_base:.2f}")
+            return None
     
     def _side_label(s: str) -> str:
         return "sell" if s.upper().startswith("SELL") else "buy"
@@ -507,7 +502,7 @@ def _try_triangle(
     # Detailed trace for correctness verification (toggle via S.LOG_ARBITRAGE_STEPS)
     if getattr(S, "LOG_ARBITRAGE_STEPS", False):
         logger.info(
-            "arb-trace pattern=%s base=%s path=%s/%s/%s gross=%.6f%% net=%.6f%% vol=$%.2f steps=%s",
+            "arb-trace pattern=%s base=%s path=%s/%s/%s gross=%.6f%% net=%.6f%% vol=$%.2f steps=%s inverted_cross=%s",
             "-".join(best_pattern),
             base,
             x,
@@ -517,10 +512,11 @@ def _try_triangle(
             net_profit_pct,
             max_base,
             " || ".join(steps_trace),
+            inverted_cross,
         )
     else:
         logger.debug(
-            "triangle %s->%s->%s->%s pattern=%s gross=%.6f%% net=%.6f%% vol=$%.2f",
+            "triangle %s->%s->%s->%s pattern=%s gross=%.6f%% net=%.6f%% vol=$%.2f inverted_cross=%s",
             base,
             x,
             y,
@@ -529,6 +525,7 @@ def _try_triangle(
             gross_profit_pct,
             net_profit_pct,
             max_base,
+            inverted_cross,
         )
 
     return route
@@ -567,7 +564,7 @@ def find_candidate_routes(
         allowed_quotes = getattr(S, "ALLOWED_QUOTES", ["USDT", "BTC", "ETH", "BNB", "FDUSD", "USDC"])
         if base not in allowed_quotes:
             allowed_quotes.append(base)
-        max_assets = getattr(S, "MAX_ASSETS", 120)
+        max_assets = getattr(S, "MAX_ASSETS", 150)
         logger.info(
             f"Loaded {len(symbols)} symbols, base={base}, profit range: {min_profit_pct}% - {max_profit_pct}%, "
             f"quotes={allowed_quotes}, max_assets={max_assets}"
@@ -576,6 +573,13 @@ def find_candidate_routes(
         # Dynamic universe across multiple quotes
         universe = _top_assets_multi_quote(client, symbols, quotes=allowed_quotes, max_assets=max_assets)
         
+        # Add curated small/mid caps
+        curated = [
+            "EDEN", "ONT", "BB", "CYBER", "SHELL", "OPEN", "XPL", "BANANA",
+            "SHIB", "PEPE", "WIF", "ORDI", "INJ", "FTM", "RUNE",
+        ]
+        universe = list(dict.fromkeys(universe + curated))
+        
         # Fallback if dynamic fails
         if not universe:
             universe = [
@@ -583,7 +587,8 @@ def find_candidate_routes(
                 "AVAX", "DOT", "LINK", "UNI", "ATOM", "LTC", "ETC", "XLM",
                 "ALGO", "VET", "FIL", "TRX", "EOS", "AAVE", "SXP", "CHZ",
                 "BICO", "LISTA", "APT", "ARB", "OP", "SUI", "SEI", "TIA",
-                "SHIB", "PEPE", "WIF", "ORDI", "TIA", "INJ", "FTM", "RUNE",
+                "SHIB", "PEPE", "WIF", "ORDI", "INJ", "FTM", "RUNE",
+                "EDEN", "ONT", "BB", "CYBER", "SHELL", "OPEN", "XPL", "BANANA",
             ]
         
         universe = [asset for asset in universe if asset != base][:max_assets]
