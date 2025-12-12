@@ -618,58 +618,49 @@ def find_candidate_routes(
             f"quotes={allowed_quotes}, max_assets={max_assets}"
         )
         
-        # Dynamic universe across multiple quotes
-        universe = _top_assets_multi_quote(client, symbols, quotes=allowed_quotes, max_assets=max_assets)
+        # Pre-filter universe to only assets with valid base pairs
+        raw_universe = _top_assets_multi_quote(client, symbols, quotes=allowed_quotes, max_assets=max_assets)
+        curated = ["BTC", "ETH", "BNB", "SOL", "ADA", "XRP", "DOGE", "MATIC", "AVAX", "DOT", "LINK", "UNI", "ATOM", "LTC", "ETC", "XLM", "ALGO", "VET", "FIL", "TRX", "ONT", "SHIB", "PEPE", "ARB", "OP", "SUI", "APT", "INJ", "FTM", "RUNE"]
+        raw_universe = list(dict.fromkeys(raw_universe + curated))
         
-        # Add curated small/mid caps
-        curated = [
-            "EDEN", "ONT", "BB", "CYBER", "SHELL", "OPEN", "XPL", "BANANA",
-            "SHIB", "PEPE", "WIF", "ORDI", "INJ", "FTM", "RUNE",
-        ]
-        universe = list(dict.fromkeys(universe + curated))
+        # Filter to only assets that have trading base pairs
+        universe = []
+        for asset in raw_universe:
+            if asset == base:
+                continue
+            base_pair = f"{asset}{base}"
+            if base_pair in symbols and symbols[base_pair].get("status") == "TRADING":
+                universe.append(asset)
         
-        # Fallback if dynamic fails
-        if not universe:
-            universe = [
-                "BTC", "ETH", "BNB", "SOL", "ADA", "XRP", "DOGE", "MATIC",
-                "AVAX", "DOT", "LINK", "UNI", "ATOM", "LTC", "ETC", "XLM",
-                "ALGO", "VET", "FIL", "TRX", "EOS", "AAVE", "SXP", "CHZ",
-                "BICO", "LISTA", "APT", "ARB", "OP", "SUI", "SEI", "TIA",
-                "SHIB", "PEPE", "WIF", "ORDI", "INJ", "FTM", "RUNE",
-                "EDEN", "ONT", "BB", "CYBER", "SHELL", "OPEN", "XPL", "BANANA",
-            ]
-        
-        universe = [asset for asset in universe if asset != base][:max_assets]
+        universe = universe[:max_assets]
         logger.info(f"Using {len(universe)} assets: {universe[:15]}...")
         logger.info(f"Will check {len(universe) * (len(universe) - 1) // 2} unique triangles (reduced from {len(universe) * (len(universe) - 1)} by checking only j > i)")
         
-        # Step 1: Collect symbols needed for triangles
-        # For triangle base -> X -> Y -> base, we need:
-        # 1. Xbase (e.g., BTCUSDT)
-        # 2. YX (e.g., ETHBTC) or XY (e.g., BTCETH)
-        # 3. Ybase (e.g., ETHUSDT)
-        
+        # Pre-validate triangles and collect only needed symbols
+        valid_triangles = []
         needed_symbols = set()
         
-        # Add base pairs for each asset (only if they exist)
+        # Add all base pairs (already validated above)
         for asset in universe:
-            symbol_base = f"{asset}{base}"
-            if symbol_base in symbols:
-                needed_symbols.add(symbol_base)  # Xbase
+            needed_symbols.add(f"{asset}{base}")
         
-        # Add cross pairs - check both YX and XY formats, only add if they exist
+        # Check each potential triangle and add cross pairs if valid
         for i, x in enumerate(universe):
-            for y in universe[i + 1:]:
-                symbol_yx = f"{y}{x}"  # YX format (e.g., ETHBTC)
-                symbol_xy = f"{x}{y}"   # XY format (e.g., BTCETH)
-                # Only add if at least one format exists
-                if symbol_yx in symbols:
+            for j in range(i + 1, len(universe)):
+                y = universe[j]
+                symbol_yx = f"{y}{x}"
+                symbol_xy = f"{x}{y}"
+                
+                # Check if cross pair exists in either direction
+                if symbol_yx in symbols and symbols[symbol_yx].get("status") == "TRADING":
+                    valid_triangles.append((x, y))
                     needed_symbols.add(symbol_yx)
-                elif symbol_xy in symbols:
+                elif symbol_xy in symbols and symbols[symbol_xy].get("status") == "TRADING":
+                    valid_triangles.append((x, y))
                     needed_symbols.add(symbol_xy)
         
-        # All symbols in needed_symbols are guaranteed to exist
         existing_symbols = list(needed_symbols)
+        logger.info(f"Pre-validated {len(valid_triangles)} valid triangles from {len(universe)} assets")
         logger.info(f"Pre-fetching depths for {len(existing_symbols)} unique symbols...")
 
         # Optional: start websocket bookTicker stream to reduce REST polling (only if dependency available)
@@ -715,68 +706,30 @@ def find_candidate_routes(
         # Define testnet tokens that can't pair directly
         testnet_tokens = {"0G", "PNUT", "WAL", "S", "ASTER", "LUNA", "EUR"}
         
-        # Check only unique triangles (j > i to avoid duplicates)
-        for i in range(len(universe)):
-            for j in range(i + 1, len(universe)):
-                checked += 1
+        # Check only pre-validated triangles
+        for x, y in valid_triangles:
+            checked += 1
+            
+            # Try the triangle
+            r = _try_triangle(
+                client, symbols, base, x, y,
+                min_profit_pct, max_profit_pct,
+                depth_cache=depth_cache,
+                available_balance=available_balance,
+                stats=stats
+            )
                 
-                x = universe[i]
-                y = universe[j]
-                
-                # SKIP IMPOSSIBLE: Both are testnet tokens (no direct pair exists)
-                if x in testnet_tokens and y in testnet_tokens:
-                    stats["filtered_missing_pairs"] += 1
-                    continue
-                
-                # Early check: verify required pairs exist before fetching depths
-                symbol1 = f"{x}{base}"  # Xbase (e.g., BTCUSDT)
-                symbol3 = f"{y}{base}"  # Ybase (e.g., ETHUSDT)
-                
-                if not (symbol1 in symbols and symbol3 in symbols):
-                    stats["filtered_missing_pairs"] += 1
-                    # Log occasionally to show what pairs are missing
-                    if stats["filtered_missing_pairs"] <= 5 or random.random() < 0.0001:
-                        missing = []
-                        if symbol1 not in symbols:
-                            missing.append(symbol1)
-                        if symbol3 not in symbols:
-                            missing.append(symbol3)
-                        logger.debug(f"Missing base pairs for {x}/{y}: {missing}")
-                    continue
-                
-                # Check intermediate pair in either direction
-                symbol2_yx = f"{y}{x}"  # YX (e.g., ETHBTC)
-                symbol2_xy = f"{x}{y}"   # XY (e.g., BTCETH)
-                
-                if not (symbol2_yx in symbols or symbol2_xy in symbols):
-                    stats["filtered_missing_pairs"] += 1
-                    # Log occasionally
-                    if stats["filtered_missing_pairs"] <= 5 or random.random() < 0.0001:
-                        logger.debug(f"Missing cross pair for {x}/{y}: neither {symbol2_yx} nor {symbol2_xy} exists")
-                    continue
-                
-                # Try the triangle
-                r = _try_triangle(
-                    client, symbols, base, x, y,
-                    min_profit_pct, max_profit_pct,
-                    depth_cache=depth_cache,
-                    available_balance=available_balance,
-                    stats=stats
-                )
-                
-                if r:
-                    # Check for duplicates
-                    route_key = (r.a, r.b, r.c)
-                    if route_key not in route_keys:
-                        route_keys.add(route_key)
-                        logger.debug(f"Found route: {r.a} → {r.b} → {r.c}, profit: {r.profit_pct}%, volume: ${r.volume_usd}")
-                        cand.append(r)
-                        stats["routes_found"] += 1
-                        # Early exit if we found enough routes
-                        if len(cand) >= 5:
-                            break
-            if len(cand) >= 5:
-                break
+            if r:
+                # Check for duplicates
+                route_key = (r.a, r.b, r.c)
+                if route_key not in route_keys:
+                    route_keys.add(route_key)
+                    logger.debug(f"Found route: {r.a} → {r.b} → {r.c}, profit: {r.profit_pct}%, volume: ${r.volume_usd}")
+                    cand.append(r)
+                    stats["routes_found"] += 1
+                    # Early exit if we found enough routes
+                    if len(cand) >= 5:
+                        break
         
         triangle_time = time.time() - start_triangles
         stats["triangles_checked"] = checked
