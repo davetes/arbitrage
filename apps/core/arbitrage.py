@@ -177,10 +177,10 @@ class _BookTickerStream:
                 combined_url = f"{self._base_url}/stream?streams={streams}"
                 
                 # BinanceWebsocketClient starts automatically upon instantiation
-                # Pass stream_url and on_message callback
+                # on_message must be first parameter, stream_url second
                 self.client = BinanceWebsocketClient(
-                    stream_url=combined_url,
                     on_message=self._on_message,
+                    stream_url=combined_url,
                     **kwargs
                 )
                 # No need to call start() - client starts automatically
@@ -197,9 +197,10 @@ class _BookTickerStream:
                 combined_url = f"{self._base_url}/stream?streams={streams}"
                 
                 # BinanceWebsocketClient starts automatically upon instantiation
+                # on_message must be first parameter, stream_url second
                 self.client = BinanceWebsocketClient(
-                    stream_url=combined_url,
                     on_message=self._on_message,
+                    stream_url=combined_url,
                     **kwargs
                 )
                 # No need to call start() - client starts automatically
