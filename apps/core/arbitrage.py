@@ -257,7 +257,7 @@ def _depth_snapshot(client: BinanceClient, symbol: str, depth: int = 20, use_cac
             return cached
     
     backoff = 0.25
-    for _ in range(3):
+    for attempt in range(3):
         try:
             d = client.depth(symbol, limit=depth)
             if not d.get("asks") or not d.get("bids"):
@@ -281,24 +281,44 @@ def _depth_snapshot(client: BinanceClient, symbol: str, depth: int = 20, use_cac
             if use_cache:
                 _depth_cache.set(symbol, result)
             return result
-        except Exception:
-            time.sleep(backoff)
+        except Exception as e:
+            error_str = str(e).lower()
+            # Check for rate limit errors
+            if "too much request weight" in error_str or "banned" in error_str or "429" in error_str:
+                if attempt == 0:  # Only log once
+                    logger.warning(f"Rate limit detected while fetching {symbol}, waiting longer...")
+                time.sleep(min(backoff * 4, 5.0))  # Longer wait for rate limits
+            else:
+                time.sleep(backoff)
             backoff *= 2
     return None
 
 
 def _fetch_depth_parallel(client: BinanceClient, symbols: List[str], max_workers: int = 10) -> Dict[str, Optional[dict]]:
-    """Fetch multiple depth snapshots in parallel"""
+    """Fetch multiple depth snapshots in parallel with rate limiting"""
     results = {}
     
+    # Rate limiting: Binance allows ~1200 requests per minute
+    # We'll be conservative: max 10 requests per second = 600/min
+    request_delay = 0.1  # 100ms between requests = 10 req/sec
+    last_request_time = [0.0]  # Use list to allow modification in nested function
+    
     def fetch_one(symbol: str):
+        # Rate limiting: ensure minimum delay between requests
+        elapsed = time.time() - last_request_time[0]
+        if elapsed < request_delay:
+            time.sleep(request_delay - elapsed)
+        last_request_time[0] = time.time()
         return symbol, _depth_snapshot(client, symbol, use_cache=True)
     
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         future_to_symbol = {executor.submit(fetch_one, sym): sym for sym in symbols}
         for future in as_completed(future_to_symbol):
-            symbol, depth = future.result()
-            results[symbol] = depth
+            try:
+                symbol, depth = future.result()
+                results[symbol] = depth
+            except Exception as e:
+                logger.debug(f"Failed to fetch depth for {symbol}: {e}")
     
     return results
 
@@ -373,52 +393,64 @@ def _try_triangle(
     if not all([d1, d2, d3]):
         return None
     
-    # Pattern evaluation: four permutations of BUY/SELL using direct bid/ask math
+    # Pattern evaluation: Only valid patterns starting with BUY (we start with base asset)
+    # Invalid patterns starting with SELL are removed - we don't have X to sell initially
     patterns = {
         ("BUY", "BUY", "SELL"): [
-            ("ask", symbol1, d1, "BUY"),
-            ("ask", symbol2 if not inverted_cross else symbol2_alt, d2, "BUY"),
-            ("bid", symbol3, d3, "SELL"),
+            ("ask", symbol1, d1, "BUY"),   # Buy X with base (USDT)
+            ("ask", symbol2 if not inverted_cross else symbol2_alt, d2, "BUY"),   # Buy Y with X
+            ("bid", symbol3, d3, "SELL"),  # Sell Y for base (USDT)
         ],
         ("BUY", "SELL", "SELL"): [
-            ("ask", symbol1, d1, "BUY"),
-            ("bid", symbol2 if not inverted_cross else symbol2_alt, d2, "SELL"),
-            ("bid", symbol3, d3, "SELL"),
-        ],
-        ("SELL", "BUY", "BUY"): [
-            ("bid", symbol1, d1, "SELL"),
-            ("ask", symbol2 if not inverted_cross else symbol2_alt, d2, "BUY"),
-            ("ask", symbol3, d3, "BUY"),
-        ],
-        ("SELL", "SELL", "BUY"): [
-            ("bid", symbol1, d1, "SELL"),
-            ("bid", symbol2 if not inverted_cross else symbol2_alt, d2, "SELL"),
-            ("ask", symbol3, d3, "BUY"),
+            ("ask", symbol1, d1, "BUY"),   # Buy X with base (USDT)
+            ("bid", symbol2 if not inverted_cross else symbol2_alt, d2, "SELL"),  # Sell X for Y
+            ("bid", symbol3, d3, "SELL"),  # Sell Y for base (USDT)
         ],
     }
 
     def evaluate_pattern(pat: Tuple[str, str, str]):
-        amt = 1.0
-        steps = []
-        fee = (S.FEE_RATE_BPS + S.EXTRA_FEE_BPS) / 10000.0
+        """Evaluate pattern using exact formulas from user specification."""
         legs = patterns[pat]
         executed_sides = []
-
+        prices = []
+        steps = []
+        
+        # Extract prices and build step descriptions
         for (side_price, sym, depth, logical_side) in legs:
             price = depth["ask_price"] if side_price == "ask" else depth["bid_price"]
-            if price <= 0:
-                return None
-            amt_before = amt
-            if logical_side == "BUY":
-                amt = amt / price
-            else:
-                amt = amt * price
-            amt_net = amt * (1 - fee)
-            steps.append(f"{logical_side} {sym} @{price:.10f} | {amt_before:.10f}->{amt:.10f}")
+            if price <= 0 or not isinstance(price, (int, float)) or price > 1e10:
+                return None  # Invalid price
+            prices.append(price)
+            steps.append(f"{logical_side} {sym} @{price:.10f}")
             executed_sides.append(logical_side.lower())
-            amt = amt_net  # carry forward fee-adjusted amount
-
-        gross_profit_pct = (amt - 1.0) * 100.0
+        
+        # Calculate gross profit using exact formulas
+        # Pattern 1: BUY-BUY-SELL -> (1 ÷ Price₁) × (1 ÷ Price₂) × Price₃ - 1
+        # Pattern 2: BUY-SELL-SELL -> (1 ÷ Price₁) × Price₂ × Price₃ - 1
+        if pat == ("BUY", "BUY", "SELL"):
+            # Pattern 1: BUY-BUY-SELL
+            # Price₁ = Ask price of X/base (BUY X with base)
+            # Price₂ = Ask price of Y/X (BUY Y with X)
+            # Price₃ = Bid price of Y/base (SELL Y for base)
+            price1, price2, price3 = prices[0], prices[1], prices[2]
+            gross_final_amount = (1.0 / price1) * (1.0 / price2) * price3
+        elif pat == ("BUY", "SELL", "SELL"):
+            # Pattern 2: BUY-SELL-SELL
+            # Price₁ = Ask price of X/base (BUY X with base)
+            # Price₂ = Bid price of X/Y (SELL X for Y) - note: might be inverted
+            # Price₃ = Bid price of Y/base (SELL Y for base)
+            price1, price2, price3 = prices[0], prices[1], prices[2]
+            gross_final_amount = (1.0 / price1) * price2 * price3
+        else:
+            return None
+        
+        # Calculate gross profit percentage
+        gross_profit_pct = (gross_final_amount - 1.0) * 100.0
+        
+        # Validate profit is reasonable (between -100% and 1000%)
+        if gross_profit_pct < -100 or gross_profit_pct > 1000:
+            return None
+        
         return {
             "gross_pct": gross_profit_pct,
             "steps": steps,
@@ -439,7 +471,12 @@ def _try_triangle(
         return None
 
     gross_profit_pct = best["gross_pct"]
-    net_profit_pct = gross_profit_pct  # fees already applied per leg into amt
+    # Calculate net profit by applying fees (3 trades, fee per trade)
+    fee_rate = (S.FEE_RATE_BPS + S.EXTRA_FEE_BPS) / 10000.0
+    total_fee = 3 * fee_rate  # 3 trades in triangular arbitrage
+    gross_multiplier = 1.0 + (gross_profit_pct / 100.0)
+    net_multiplier = gross_multiplier * (1.0 - total_fee)
+    net_profit_pct = (net_multiplier - 1.0) * 100.0
     gross_net = (1 + gross_profit_pct / 100.0)
     steps_trace = best["steps"]
     executed_sides = best["sides"]
@@ -629,30 +666,57 @@ def find_candidate_routes(
         elif getattr(S, "USE_BOOK_TICKER_WS", True) and SpotWebsocketClient is None:
             logger.warning("USE_BOOK_TICKER_WS is True but SpotWebsocketClient is not installed; using REST depth only.")
         
-        # Step 2: Fetch depths in parallel - reduced from 20 to 10 workers
+        # Step 2: Fetch depths in parallel with rate limiting (reduced workers to avoid bans)
         start_fetch = time.time()
-        depth_cache = _fetch_depth_parallel(client, existing_symbols, max_workers=10)
+        # Limit symbols to fetch to avoid rate limits (max 200 symbols)
+        max_symbols_to_fetch = getattr(S, "MAX_DEPTH_FETCH", 200)
+        symbols_to_fetch = existing_symbols[:max_symbols_to_fetch]
+        if len(existing_symbols) > max_symbols_to_fetch:
+            logger.warning(f"Limiting depth fetch to {max_symbols_to_fetch} symbols to avoid rate limits (requested {len(existing_symbols)})")
+        depth_cache = _fetch_depth_parallel(client, symbols_to_fetch, max_workers=5)  # Reduced to 5 workers
         fetch_time = time.time() - start_fetch
         fetched_count = sum(1 for v in depth_cache.values() if v is not None)
         stats["symbols_fetched"] = fetched_count
         stats["fetch_time"] = fetch_time
-        logger.info(f"Fetched {fetched_count}/{len(existing_symbols)} depths in {fetch_time:.2f}s")
+        logger.info(f"Fetched {fetched_count}/{len(symbols_to_fetch)} depths in {fetch_time:.2f}s")
         
-        # Step 3: Check triangles
+        # Step 3: Check triangles in BOTH directions
         cand: List[CandidateRoute] = []
         checked = 0
         start_triangles = time.time()
+        route_keys = set()  # Track unique routes
         
-        for i, x in enumerate(universe):
-            for y in universe[i + 1:]:
+        # Define testnet tokens that can't pair directly
+        testnet_tokens = {"0G", "PNUT", "WAL", "S", "ASTER", "LUNA", "EUR"}
+        
+        # Check all unique asset pairs (both directions)
+        for i in range(len(universe)):
+            for j in range(len(universe)):
+                if i == j:
+                    continue  # Skip same asset
                 checked += 1
                 
-                # Check if all required symbols exist
-                symbol1 = f"{x}{base}"
-                symbol2 = f"{y}{x}"
-                symbol3 = f"{y}{base}"
+                x = universe[i]
+                y = universe[j]
                 
-                if not all(s in symbols for s in [symbol1, symbol2, symbol3]):
+                # SKIP IMPOSSIBLE: Both are testnet tokens (no direct pair exists)
+                if x in testnet_tokens and y in testnet_tokens:
+                    stats["filtered_missing_pairs"] += 1
+                    continue
+                
+                # Check if required pairs could exist
+                symbol1 = f"{x}{base}"  # Xbase (e.g., BTCUSDT)
+                symbol3 = f"{y}{base}"  # Ybase (e.g., ETHUSDT)
+                
+                if not (symbol1 in symbols and symbol3 in symbols):
+                    stats["filtered_missing_pairs"] += 1
+                    continue
+                
+                # Check intermediate pair in either direction
+                symbol2_yx = f"{y}{x}"  # YX (e.g., ETHBTC)
+                symbol2_xy = f"{x}{y}"   # XY (e.g., BTCETH)
+                
+                if not (symbol2_yx in symbols or symbol2_xy in symbols):
                     stats["filtered_missing_pairs"] += 1
                     continue
                 
@@ -666,9 +730,18 @@ def find_candidate_routes(
                 )
                 
                 if r:
-                    logger.debug(f"Found route: {r.a} → {r.b} → {r.c}, profit: {r.profit_pct}%, volume: ${r.volume_usd}")
-                    cand.append(r)
-                    stats["routes_found"] += 1
+                    # Check for duplicates
+                    route_key = (r.a, r.b, r.c)
+                    if route_key not in route_keys:
+                        route_keys.add(route_key)
+                        logger.debug(f"Found route: {r.a} → {r.b} → {r.c}, profit: {r.profit_pct}%, volume: ${r.volume_usd}")
+                        cand.append(r)
+                        stats["routes_found"] += 1
+                        # Early exit if we found enough routes
+                        if len(cand) >= 5:
+                            break
+            if len(cand) >= 5:
+                break
         
         triangle_time = time.time() - start_triangles
         stats["triangles_checked"] = checked
