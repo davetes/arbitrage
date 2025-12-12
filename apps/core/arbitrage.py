@@ -448,7 +448,13 @@ def _try_triangle(
         gross_profit_pct = (gross_final_amount - 1.0) * 100.0
         
         # Validate profit is reasonable (between -100% and 1000%)
+        # But allow slightly wider range for debugging (up to 10% to catch edge cases)
         if gross_profit_pct < -100 or gross_profit_pct > 1000:
+            return None
+        
+        # Additional validation: check for obviously wrong calculations
+        # If any price is extremely small or large, the calculation might be wrong
+        if any(p < 1e-10 or p > 1e10 for p in prices):
             return None
         
         return {
@@ -493,8 +499,22 @@ def _try_triangle(
     if gross_profit_pct < min_prof or gross_profit_pct > max_prof:
         if stats is not None:
             stats["filtered_profit"] = stats.get("filtered_profit", 0) + 1
-        if random.random() < 0.01:
-            logger.debug(f"Route filtered by gross: {base}->{x}->{y}->{base} gross={gross_profit_pct:.4f}% (net={net_profit_pct:.4f}%)")
+            # Track routes close to target range for debugging
+            if 0.5 <= gross_profit_pct <= 6.0:  # Close to 1-5% range
+                close_routes = stats.get("close_routes", [])
+                if len(close_routes) < 5:
+                    close_routes.append({
+                        "route": f"{base}->{x}->{y}->{base}",
+                        "gross": gross_profit_pct,
+                        "net": net_profit_pct,
+                        "pattern": "-".join(best_pattern)
+                    })
+                    stats["close_routes"] = close_routes
+        # Log routes close to target range more frequently
+        if 0.5 <= gross_profit_pct <= 6.0 and random.random() < 0.1:
+            logger.info(f"Route near target range: {base}->{x}->{y}->{base} gross={gross_profit_pct:.4f}% (target: {min_prof:.1f}-{max_prof:.1f}%)")
+        elif random.random() < 0.001:  # Very rare logging for other routes
+            logger.debug(f"Route filtered: {base}->{x}->{y}->{base} gross={gross_profit_pct:.4f}%")
         return None
     
     # In theoretical mode, skip capacity and notional checks
@@ -668,11 +688,17 @@ def find_candidate_routes(
         
         # Step 2: Fetch depths in parallel with rate limiting (reduced workers to avoid bans)
         start_fetch = time.time()
+        # Prioritize symbols: base pairs first (most important), then cross pairs
+        base_pairs = [s for s in existing_symbols if s.endswith(base)]
+        cross_pairs = [s for s in existing_symbols if not s.endswith(base)]
+        # Prioritize base pairs, then cross pairs
+        prioritized_symbols = base_pairs + cross_pairs
+        
         # Limit symbols to fetch to avoid rate limits (max 200 symbols)
         max_symbols_to_fetch = getattr(S, "MAX_DEPTH_FETCH", 200)
-        symbols_to_fetch = existing_symbols[:max_symbols_to_fetch]
+        symbols_to_fetch = prioritized_symbols[:max_symbols_to_fetch]
         if len(existing_symbols) > max_symbols_to_fetch:
-            logger.warning(f"Limiting depth fetch to {max_symbols_to_fetch} symbols to avoid rate limits (requested {len(existing_symbols)})")
+            logger.warning(f"Limiting depth fetch to {max_symbols_to_fetch} symbols (prioritized {len(base_pairs)} base pairs) to avoid rate limits (requested {len(existing_symbols)})")
         depth_cache = _fetch_depth_parallel(client, symbols_to_fetch, max_workers=5)  # Reduced to 5 workers
         fetch_time = time.time() - start_fetch
         fetched_count = sum(1 for v in depth_cache.values() if v is not None)
@@ -755,6 +781,13 @@ def find_candidate_routes(
             profits = stats["sample_profits"]
             if profits:
                 logger.info(f"Profit sample (n={len(profits)}): min={min(profits):.6f}%, max={max(profits):.6f}%, avg={sum(profits)/len(profits):.6f}%")
+        
+        # Log routes that were close to target range
+        if stats.get("close_routes"):
+            close_routes = stats["close_routes"]
+            logger.info(f"Found {len(close_routes)} routes close to target range (0.5-6.0%):")
+            for cr in close_routes[:3]:  # Show first 3
+                logger.info(f"  {cr['route']}: {cr['gross']:.4f}% gross ({cr['net']:.4f}% net) pattern={cr['pattern']}")
         
         # Sort by profit desc and return top 5
         cand.sort(key=lambda z: z.profit_pct, reverse=True)
