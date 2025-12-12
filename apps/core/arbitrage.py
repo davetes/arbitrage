@@ -454,68 +454,76 @@ def _top_assets_by_quote_volume(
         return []
 
 
-def _select_all_assets(
+def _select_liquid_assets(
     client: BinanceClient,
     symbols: Dict[str, dict],
     quotes: List[str],
+    target_assets: int = 60,
 ) -> Tuple[List[str], Dict[str, float]]:
-    """
-    Load ALL assets that trade with major quotes (2000+ symbols).
-    First extracts all tradable assets from symbols dict, then uses ticker data only for volume ranking.
-    """
+    """Select only the most liquid, high-volume assets for better arbitrage opportunities"""
+    try:
+        stats = client.ticker_24hr()
+    except Exception:
+        return [], {}
+
     quotes_upper = {q.upper() for q in quotes}
-    assets_set = set()
-    volumes = {}
-    
-    # STEP 1: Extract ALL assets from symbols dict first (primary source)
-    for sym, info in symbols.items():
+    vol_by_asset: Dict[str, float] = {}
+    count_by_asset: Dict[str, int] = {}
+
+    # Calculate volume and quote count for each asset
+    for s in stats:
+        sym = s.get("symbol")
+        if not sym or sym not in symbols:
+            continue
+        info = symbols[sym]
         if info.get("status") != "TRADING":
             continue
         quote = info.get("quoteAsset", "").upper()
         if quote not in quotes_upper:
             continue
         base_asset = info.get("baseAsset", "").upper()
-        if base_asset and base_asset != quote:
-            assets_set.add(base_asset)
-            # Initialize volume to 0, will be updated from ticker data if available
-            volumes[base_asset] = volumes.get(base_asset, 0.0)
+        if not base_asset or base_asset == quote:
+            continue
+        try:
+            vol = float(s.get("quoteVolume", 0))
+            # Lower volume requirement to find more channel-like opportunities
+            if vol > 100000:  # Reduced from 500k to 100k
+                vol_by_asset[base_asset] = max(vol_by_asset.get(base_asset, 0.0), vol)
+                count_by_asset[base_asset] = count_by_asset.get(base_asset, 0) + 1
+        except Exception:
+            continue
+
+    # Priority assets (proven arbitrage opportunities from trading channels)
+    priority = {"BTC", "ETH", "BNB", "SOL", "ADA", "DOT", "LINK", "MATIC", "AVAX", "XRP", "LTC", "BCH", "ONT", "SSV", "KITE", "ATOM", "FTM", "NEAR", "ALGO", "XTZ", "EGLD", "SAND", "MANA", "CRV", "UNI"}
     
-    logger.info(f"Extracted {len(assets_set)} assets from symbols dict")
+    # Filter to top liquid assets only
+    liquid_assets = [(asset, vol) for asset, vol in vol_by_asset.items() 
+                    if count_by_asset.get(asset, 0) >= 2]  # Must trade with at least 2 major quotes
     
-    # STEP 2: Use ticker data ONLY for volume ranking (not for asset discovery)
-    try:
-        stats = client.ticker_24hr()
-        ticker_symbol_map = {}
-        for s in stats:
-            sym = s.get("symbol", "").upper()
-            if sym:
-                ticker_symbol_map[sym] = s
+    # Score by liquidity metrics
+    scored = []
+    for asset, vol in liquid_assets:
+        # Base score from volume
+        score = vol
         
-        # Update volumes from ticker data for assets we already found
-        for sym, info in symbols.items():
-            if info.get("status") != "TRADING":
-                continue
-            quote = info.get("quoteAsset", "").upper()
-            if quote not in quotes_upper:
-                continue
-            base_asset = info.get("baseAsset", "").upper()
-            if base_asset and base_asset != quote and base_asset in assets_set:
-                # Get volume from ticker data if available
-                ticker_data = ticker_symbol_map.get(sym.upper())
-                if ticker_data:
-                    try:
-                        vol = float(ticker_data.get("quoteVolume", 0))
-                        # Keep maximum volume across all quote pairs for this asset
-                        volumes[base_asset] = max(volumes.get(base_asset, 0.0), vol)
-                    except Exception:
-                        pass
+        # Multi-quote bonus (more arbitrage paths)
+        quote_count = count_by_asset.get(asset, 0)
+        score += quote_count * 10000000  # 10M bonus per quote
         
-        logger.info(f"Updated volumes for {len([v for v in volumes.values() if v > 0])} assets from ticker data")
-    except Exception as e:
-        logger.warning(f"Failed to fetch ticker data for volume ranking: {e}. Using symbols-only data.")
+        # Priority asset bonus
+        if asset in priority:
+            score *= 5  # 5x score for proven assets
+        
+        scored.append((score, asset, vol))
     
-    # Return all assets (2000+) with volumes
-    return list(assets_set), volumes
+    # Select top assets by score
+    scored.sort(reverse=True)
+    selected = [asset for _, asset, _ in scored[:target_assets]]
+    volumes = {asset: vol for _, asset, vol in scored[:target_assets]}
+    
+    logger.info(f"Asset selection: {len(selected)} from {len(vol_by_asset)} candidates (min volume: $500k, min quotes: 2)")
+    
+    return selected, volumes
 
 
 def _depth_snapshot(client: BinanceClient, symbol: str, depth: int = 20, use_cache: bool = True) -> Optional[dict]:
@@ -795,12 +803,12 @@ def _try_triangle(
             if price <= 0 or not isinstance(price, (int, float)) or price > 1e8:
                 return None  # Invalid price
             
-            # Check bid/ask spread is reasonable (< 10% for most pairs)
+            # Check bid/ask spread is reasonable - be more permissive for opportunities
             ask_price = depth["ask_price"]
             bid_price = depth["bid_price"]
             if ask_price > 0 and bid_price > 0:
                 spread_pct = ((ask_price - bid_price) / bid_price) * 100
-                if spread_pct > 20:  # Reject pairs with >20% spread (likely stale data)
+                if spread_pct > 50:  # More permissive spread (was 20%) to find more routes
                     return None
             
             # Apply trade: BUY divides amount by price, SELL multiplies amount by price
@@ -860,15 +868,15 @@ def _try_triangle(
         if len(stats.get("sample_profits", [])) < 100:
             stats["sample_profits"].append(gross_profit_pct)
     
-    # Check profit thresholds using GROSS profit
-    min_prof = min_profit_pct if min_profit_pct is not None else getattr(S, "MIN_PROFIT_PCT", 1.0)
-    max_prof = max_profit_pct if max_profit_pct is not None else S.MAX_PROFIT_PCT
+    # Check profit thresholds using GROSS profit - target 1.0-2.5% range like trading channels
+    min_prof = min_profit_pct if min_profit_pct is not None else 0.8  # Slightly below 1.0% to catch opportunities
+    max_prof = max_profit_pct if max_profit_pct is not None else 5.0   # Higher ceiling to capture all good routes
     
     if gross_profit_pct < min_prof or gross_profit_pct > max_prof:
         if stats is not None:
             stats["filtered_profit"] = stats.get("filtered_profit", 0) + 1
             # Track routes close to target range for debugging
-            if 0.5 <= gross_profit_pct <= 6.0:  # Close to 1-5% range
+            if 0.3 <= gross_profit_pct <= 6.0:  # Wider range for debugging
                 close_routes = stats.get("close_routes", [])
                 if len(close_routes) < 10:
                     close_routes.append({
@@ -878,10 +886,12 @@ def _try_triangle(
                         "pattern": "-".join(best_pattern)
                     })
                     stats["close_routes"] = close_routes
-        # Log routes close to target range more frequently
-        if 0.5 <= gross_profit_pct <= 6.0 and random.random() < 0.1:
-            logger.info(f"Route near target range: {base}->{x}->{y}->{base} gross={gross_profit_pct:.4f}% (target: {min_prof:.1f}-{max_prof:.1f}%)")
-        elif random.random() < 0.001:  # Very rare logging for other routes
+        # Log ALL routes near 1-2.5% range for debugging
+        if 0.8 <= gross_profit_pct <= 3.0:  # Focus on target range
+            logger.info(f"FOUND CHANNEL-LIKE ROUTE: {base}->{x}->{y}->{base} gross={gross_profit_pct:.4f}% (target: 1.0-2.5%)")
+        elif 0.3 <= gross_profit_pct <= 6.0 and random.random() < 0.3:  # More frequent logging
+            logger.info(f"Route near target: {base}->{x}->{y}->{base} gross={gross_profit_pct:.4f}%")
+        elif random.random() < 0.05:  # More debugging
             logger.debug(f"Route filtered: {base}->{x}->{y}->{base} gross={gross_profit_pct:.4f}%")
         return None
     
@@ -965,10 +975,10 @@ def _score_triangle(x: str, y: str, base: str, asset_volumes: Dict[str, float], 
     if x in majors and y in majors:
         score += 1000.0
     
-    # High-priority assets from screenshot examples
-    priority_assets = {"ONT", "SSV", "KITE", "SOL", "ADA", "DOT", "LINK", "MATIC"}
+    # High-priority assets from trading channels and screenshot examples
+    priority_assets = {"ONT", "SSV", "KITE", "SOL", "ADA", "DOT", "LINK", "MATIC", "AVAX", "ATOM", "FTM", "NEAR", "ALGO", "XTZ", "EGLD"}
     if x in priority_assets or y in priority_assets:
-        score += 500.0
+        score += 800.0  # Higher priority for channel assets
     
     # Major quote routing (medium-high priority)
     elif x in majors or y in majors:
@@ -1028,8 +1038,8 @@ def _optimize_symbol_selection(scored_triangles: List[Tuple[float, str, str]],
             for sym in valid_symbols:
                 symbol_usage[sym] = symbol_usage.get(sym, 0) + 1
             
-            # Early exit if we have enough triangles (increased limit for larger sets)
-            if len(selected_triangles) >= 2000:
+            # Limit triangles for better quality (focus on completable triangles)
+            if len(selected_triangles) >= 800:  # Reduced from 2000 for better quality
                 break
     
     logger.debug(f"Symbol optimization: {len(required_symbols)} symbols for {len(selected_triangles)} triangles")
@@ -1081,9 +1091,10 @@ def find_candidate_routes(
         MAJOR_QUOTES = ["USDT", "BTC", "ETH", "BNB", "USDC", "FDUSD"]
         MAJOR_ASSETS = {"BTC", "ETH", "BNB", "USDT", "USDC", "FDUSD"}
         
-        # Load ALL assets (2000+) that trade with major quotes
-        universe, asset_volumes = _select_all_assets(client, symbols, MAJOR_QUOTES)
-        logger.info(f"Loaded {len(universe)} assets from all trading pairs (2000+ symbols)")
+        # Focus on top 60 liquid assets for better arbitrage opportunities
+        target_assets = min(getattr(S, "MAX_ASSETS", 80), 60)  # Cap at 60 for quality
+        universe, asset_volumes = _select_liquid_assets(client, symbols, MAJOR_QUOTES, target_assets)
+        logger.info(f"Selected {len(universe)} top liquid assets (quality over quantity)")
         
         _performance.symbols_loaded = len(symbols)
         
@@ -1168,7 +1179,7 @@ def find_candidate_routes(
         base_trading_assets.sort(key=lambda a: asset_volumes.get(a, 0.0), reverse=True)
         
         # Limit direct triangle checks to top pairs to avoid explosion
-        max_direct_checks = getattr(S, "MAX_DIRECT_TRIANGLES", 10000)  # Increased limit
+        max_direct_checks = getattr(S, "MAX_DIRECT_TRIANGLES", 3000)  # Reduced for quality focus
         checked_pairs = 0
         
         for i, asset in enumerate(base_trading_assets):
@@ -1196,8 +1207,8 @@ def find_candidate_routes(
         stats["triangles_generated"] = len(all_triangles)
         
         # Optimize symbol selection for rate limits
-        # Increase limit for larger symbol sets
-        max_symbols_to_fetch = getattr(S, "MAX_DEPTH_FETCH", 500)  # Increased from 200
+        # Focus on quality over quantity
+        max_symbols_to_fetch = getattr(S, "MAX_DEPTH_FETCH", 300)  # Reduced for better coverage
         
         # Extract triangles without require_intermediate flag for optimization function
         triangles_for_opt = [(score, x, y) for score, x, y, _ in all_triangles]
