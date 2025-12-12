@@ -45,9 +45,6 @@ class DepthCache:
 # Global depth cache instance (2 second TTL)
 _depth_cache = DepthCache(ttl_seconds=2.0)
 
-# Global WebSocket stream instance with persistent connection
-_book_ticker_stream = _BookTickerStream(ttl_seconds=5.0)  # Increased TTL for better cache hit rate
-
 
 class _BookTickerStream:
     """Websocket-based best bid/ask cache with persistent connection and combined streams."""
@@ -222,7 +219,8 @@ class _BookTickerStream:
             return valid_count, len(symbols)
 
 
-# _book_ticker_stream is now defined above after DepthCache
+# Global WebSocket stream instance with persistent connection (created after class definition)
+_book_ticker_stream = _BookTickerStream(ttl_seconds=5.0)  # Increased TTL for better cache hit rate
 
 
 @dataclass
