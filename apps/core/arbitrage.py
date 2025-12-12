@@ -620,68 +620,148 @@ def find_candidate_routes(
         allowed_quotes = getattr(S, "ALLOWED_QUOTES", ["USDT", "BTC", "ETH", "BNB", "FDUSD", "USDC"])
         if base not in allowed_quotes:
             allowed_quotes.append(base)
-        max_assets = getattr(S, "MAX_ASSETS", 30)  # Optimized for cross-pair coverage
+        max_assets = getattr(S, "MAX_ASSETS", 50)  # Expanded for major quote coverage
         logger.info(
             f"Loaded {len(symbols)} symbols, base={base}, profit range: {min_profit_pct}% - {max_profit_pct}%, "
             f"quotes={allowed_quotes}, max_assets={max_assets}"
         )
         
-        # Use curated high-quality universe with known cross pairs
-        curated_universe = [
-            # Major cryptocurrencies (highly likely to have cross pairs)
-            "BTC", "ETH", "BNB", "SOL", "XRP", "ADA", "DOGE", "MATIC",
-            "DOT", "LINK", "UNI", "AVAX", "ATOM", "LTC", "TRX", "ETC",
-            "FIL", "ALGO", "VET", "XLM", "EOS", "AAVE",
-            # Stablecoins for arbitrage
-            "USDC", "FDUSD",
-            # High-volume tokens
-            "SHIB", "PEPE", "ARB", "OP", "SUI", "APT"
-        ]
+        # Define major quotes for routing
+        MAJOR_QUOTES = ["USDT", "BTC", "ETH", "BNB", "USDC", "FDUSD"]
         
-        # Filter to only assets that have trading base pairs
-        universe = []
-        for asset in curated_universe:
-            if asset == base:
+        # Build comprehensive asset universe trading with major quotes
+        universe = set()
+        asset_quote_map = {}  # Track which quotes each asset trades with
+        
+        for symbol_name, symbol_info in symbols.items():
+            if symbol_info.get("status") != "TRADING":
                 continue
-            base_pair = f"{asset}{base}"
-            if base_pair in symbols and symbols[base_pair].get("status") == "TRADING":
-                universe.append(asset)
-        logger.info(f"Using {len(universe)} curated assets: {universe}")
-        total_possible = len(universe) * (len(universe) - 1) // 2
-        logger.info(f"Will check up to {total_possible} triangles from curated universe")
+            quote_asset = symbol_info.get("quoteAsset")
+            base_asset = symbol_info.get("baseAsset")
+            
+            if quote_asset in MAJOR_QUOTES and base_asset != base:
+                universe.add(base_asset)
+                if base_asset not in asset_quote_map:
+                    asset_quote_map[base_asset] = set()
+                asset_quote_map[base_asset].add(quote_asset)
         
-        # Pre-validate triangles and collect only needed symbols
+        # Prioritize assets trading with multiple major quotes
+        universe_list = sorted(universe, key=lambda x: len(asset_quote_map.get(x, set())), reverse=True)
+        universe = universe_list[:max_assets * 2]  # Expand for better coverage
+        logger.info(f"Using {len(universe)} assets trading with major quotes: {universe[:10]}{'...' if len(universe) > 10 else ''}")
+        logger.info(f"Major quotes: {MAJOR_QUOTES}")
+        logger.info(f"Detecting all triangle patterns: direct, major-quote routing, major-to-major arbitrage")
+        
+        # Generate all possible triangular paths through major quotes
         valid_triangles = []
         needed_symbols = set()
         
-        # Add all base pairs (already validated above)
-        for asset in universe:
-            needed_symbols.add(f"{asset}{base}")
+        # Add all major quote base pairs
+        for quote in MAJOR_QUOTES:
+            if quote != base:
+                major_pair = f"{quote}{base}"
+                if major_pair in symbols and symbols[major_pair].get("status") == "TRADING":
+                    needed_symbols.add(major_pair)
         
-        # Check each potential triangle and add cross pairs if valid
-        for i, x in enumerate(universe):
-            for j in range(i + 1, len(universe)):
-                y = universe[j]
-                symbol_yx = f"{y}{x}"
-                symbol_xy = f"{x}{y}"
+        # Generate triangles for each asset
+        for asset in universe:
+            asset_quotes = asset_quote_map.get(asset, set())
+            
+            # Pattern 1: Direct USDT triangles (asset -> other_asset -> USDT)
+            if base in asset_quotes:
+                asset_base = f"{asset}{base}"
+                needed_symbols.add(asset_base)
                 
-                # Check if cross pair exists in either direction
-                if symbol_yx in symbols and symbols[symbol_yx].get("status") == "TRADING":
-                    valid_triangles.append((x, y))
-                    needed_symbols.add(symbol_yx)
-                elif symbol_xy in symbols and symbols[symbol_xy].get("status") == "TRADING":
-                    valid_triangles.append((x, y))
-                    needed_symbols.add(symbol_xy)
+                # Find other assets that can form triangles with this asset
+                for other_asset in universe:
+                    if other_asset == asset:
+                        continue
+                    other_quotes = asset_quote_map.get(other_asset, set())
+                    
+                    # Direct cross pair
+                    cross_pair1 = f"{other_asset}{asset}"
+                    cross_pair2 = f"{asset}{other_asset}"
+                    if cross_pair1 in symbols and symbols[cross_pair1].get("status") == "TRADING":
+                        if base in other_quotes:
+                            valid_triangles.append((asset, other_asset))
+                            needed_symbols.add(cross_pair1)
+                            needed_symbols.add(f"{other_asset}{base}")
+                    elif cross_pair2 in symbols and symbols[cross_pair2].get("status") == "TRADING":
+                        if base in other_quotes:
+                            valid_triangles.append((asset, other_asset))
+                            needed_symbols.add(cross_pair2)
+                            needed_symbols.add(f"{other_asset}{base}")
+            
+            # Pattern 2: Major quote routing (USDT -> major -> asset -> USDT)
+            for major in ["BTC", "ETH", "BNB"]:
+                if major == base or major == asset:
+                    continue
+                
+                # Check if asset trades with this major
+                if major in asset_quotes:
+                    asset_major = f"{asset}{major}"
+                    major_base = f"{major}{base}"
+                    
+                    if (asset_major in symbols and symbols[asset_major].get("status") == "TRADING" and
+                        major_base in symbols and symbols[major_base].get("status") == "TRADING"):
+                        
+                        # USDT -> major -> asset -> USDT triangle
+                        if base in asset_quotes:
+                            valid_triangles.append((major, asset))
+                            needed_symbols.add(major_base)
+                            needed_symbols.add(asset_major)
+                            needed_symbols.add(f"{asset}{base}")
+            
+            # Pattern 3: Major-to-major arbitrage (USDT -> BTC -> ETH -> USDT)
+            major_assets = ["BTC", "ETH", "BNB"]
+            for i, major1 in enumerate(major_assets):
+                if major1 == base:
+                    continue
+                for major2 in major_assets[i+1:]:
+                    if major2 == base or major2 == major1:
+                        continue
+                    
+                    major1_base = f"{major1}{base}"
+                    major2_base = f"{major2}{base}"
+                    cross_major1 = f"{major2}{major1}"
+                    cross_major2 = f"{major1}{major2}"
+                    
+                    if (major1_base in symbols and major2_base in symbols and
+                        symbols[major1_base].get("status") == "TRADING" and
+                        symbols[major2_base].get("status") == "TRADING"):
+                        
+                        if cross_major1 in symbols and symbols[cross_major1].get("status") == "TRADING":
+                            valid_triangles.append((major1, major2))
+                            needed_symbols.add(major1_base)
+                            needed_symbols.add(major2_base)
+                            needed_symbols.add(cross_major1)
+                        elif cross_major2 in symbols and symbols[cross_major2].get("status") == "TRADING":
+                            valid_triangles.append((major1, major2))
+                            needed_symbols.add(major1_base)
+                            needed_symbols.add(major2_base)
+                            needed_symbols.add(cross_major2)
         
         existing_symbols = list(needed_symbols)
-        coverage_pct = (len(valid_triangles) / total_possible) * 100 if total_possible > 0 else 0
-        logger.info(f"Pre-validated {len(valid_triangles)}/{total_possible} triangles ({coverage_pct:.1f}% coverage)")
         
-        # Log cross-pair analysis
-        cross_pairs_found = len(valid_triangles)
-        cross_pairs_missing = total_possible - cross_pairs_found
-        logger.info(f"Cross-pair availability: {cross_pairs_found} found, {cross_pairs_missing} missing")
-        logger.info(f"Pre-fetching depths for {len(existing_symbols)} unique symbols...")
+        # Analyze triangle types
+        direct_count = 0
+        major_quote_count = 0
+        major_to_major_count = 0
+        
+        for x, y in valid_triangles:
+            if x in ["BTC", "ETH", "BNB"] and y in ["BTC", "ETH", "BNB"]:
+                major_to_major_count += 1
+            elif x in ["BTC", "ETH", "BNB"] or y in ["BTC", "ETH", "BNB"]:
+                major_quote_count += 1
+            else:
+                direct_count += 1
+        
+        logger.info(f"Generated {len(valid_triangles)} triangles: {direct_count} direct, {major_quote_count} via majors, {major_to_major_count} major-to-major")
+        
+        # Log asset coverage
+        assets_with_multiple_quotes = sum(1 for asset in universe if len(asset_quote_map.get(asset, set())) > 1)
+        logger.info(f"Asset coverage: {len(universe)} assets, {assets_with_multiple_quotes} trade with multiple major quotes")
+        logger.info(f"Collecting depths for {len(existing_symbols)} symbols across all major quote pairs")
 
         # Optional: start websocket bookTicker stream to reduce REST polling (only if dependency available)
         use_ws = getattr(S, "USE_BOOK_TICKER_WS", True) and SpotWebsocketClient is not None
