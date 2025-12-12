@@ -422,9 +422,17 @@ def _try_triangle(
             # Get correct price: ask for BUY, bid for SELL
             price = depth["ask_price"] if side_price == "ask" else depth["bid_price"]
             
-            # Validate price
-            if price <= 0 or not isinstance(price, (int, float)) or price > 1e10:
+            # Validate price is reasonable
+            if price <= 0 or not isinstance(price, (int, float)) or price > 1e8:
                 return None  # Invalid price
+            
+            # Check bid/ask spread is reasonable (< 10% for most pairs)
+            ask_price = depth["ask_price"]
+            bid_price = depth["bid_price"]
+            if ask_price > 0 and bid_price > 0:
+                spread_pct = ((ask_price - bid_price) / bid_price) * 100
+                if spread_pct > 20:  # Reject pairs with >20% spread (likely stale data)
+                    return None
             
             # Apply trade: BUY divides amount by price, SELL multiplies amount by price
             amount_before = amount
@@ -444,8 +452,8 @@ def _try_triangle(
         # Calculate gross profit percentage: (final_amount - 1.0) * 100.0
         gross_profit_pct = (amount - 1.0) * 100.0
         
-        # Validate profit is reasonable (between -100% and 1000%)
-        if gross_profit_pct < -100 or gross_profit_pct > 1000:
+        # Validate profit is reasonable (between -50% and 50%)
+        if gross_profit_pct < -50 or gross_profit_pct > 50:
             return None
         
         return {
@@ -493,7 +501,7 @@ def _try_triangle(
             # Track routes close to target range for debugging
             if 0.5 <= gross_profit_pct <= 6.0:  # Close to 1-5% range
                 close_routes = stats.get("close_routes", [])
-                if len(close_routes) < 5:
+                if len(close_routes) < 10:
                     close_routes.append({
                         "route": f"{base}->{x}->{y}->{base}",
                         "gross": gross_profit_pct,
@@ -612,29 +620,35 @@ def find_candidate_routes(
         allowed_quotes = getattr(S, "ALLOWED_QUOTES", ["USDT", "BTC", "ETH", "BNB", "FDUSD", "USDC"])
         if base not in allowed_quotes:
             allowed_quotes.append(base)
-        max_assets = getattr(S, "MAX_ASSETS", 80)  # Reduced from 150 to 80 for better efficiency
+        max_assets = getattr(S, "MAX_ASSETS", 30)  # Optimized for cross-pair coverage
         logger.info(
             f"Loaded {len(symbols)} symbols, base={base}, profit range: {min_profit_pct}% - {max_profit_pct}%, "
             f"quotes={allowed_quotes}, max_assets={max_assets}"
         )
         
-        # Pre-filter universe to only assets with valid base pairs
-        raw_universe = _top_assets_multi_quote(client, symbols, quotes=allowed_quotes, max_assets=max_assets)
-        curated = ["BTC", "ETH", "BNB", "SOL", "ADA", "XRP", "DOGE", "MATIC", "AVAX", "DOT", "LINK", "UNI", "ATOM", "LTC", "ETC", "XLM", "ALGO", "VET", "FIL", "TRX", "ONT", "SHIB", "PEPE", "ARB", "OP", "SUI", "APT", "INJ", "FTM", "RUNE"]
-        raw_universe = list(dict.fromkeys(raw_universe + curated))
+        # Use curated high-quality universe with known cross pairs
+        curated_universe = [
+            # Major cryptocurrencies (highly likely to have cross pairs)
+            "BTC", "ETH", "BNB", "SOL", "XRP", "ADA", "DOGE", "MATIC",
+            "DOT", "LINK", "UNI", "AVAX", "ATOM", "LTC", "TRX", "ETC",
+            "FIL", "ALGO", "VET", "XLM", "EOS", "AAVE",
+            # Stablecoins for arbitrage
+            "USDC", "FDUSD",
+            # High-volume tokens
+            "SHIB", "PEPE", "ARB", "OP", "SUI", "APT"
+        ]
         
         # Filter to only assets that have trading base pairs
         universe = []
-        for asset in raw_universe:
+        for asset in curated_universe:
             if asset == base:
                 continue
             base_pair = f"{asset}{base}"
             if base_pair in symbols and symbols[base_pair].get("status") == "TRADING":
                 universe.append(asset)
-        
-        universe = universe[:max_assets]
-        logger.info(f"Using {len(universe)} assets: {universe[:15]}...")
-        logger.info(f"Will check {len(universe) * (len(universe) - 1) // 2} unique triangles (reduced from {len(universe) * (len(universe) - 1)} by checking only j > i)")
+        logger.info(f"Using {len(universe)} curated assets: {universe}")
+        total_possible = len(universe) * (len(universe) - 1) // 2
+        logger.info(f"Will check up to {total_possible} triangles from curated universe")
         
         # Pre-validate triangles and collect only needed symbols
         valid_triangles = []
@@ -660,7 +674,13 @@ def find_candidate_routes(
                     needed_symbols.add(symbol_xy)
         
         existing_symbols = list(needed_symbols)
-        logger.info(f"Pre-validated {len(valid_triangles)} valid triangles from {len(universe)} assets")
+        coverage_pct = (len(valid_triangles) / total_possible) * 100 if total_possible > 0 else 0
+        logger.info(f"Pre-validated {len(valid_triangles)}/{total_possible} triangles ({coverage_pct:.1f}% coverage)")
+        
+        # Log cross-pair analysis
+        cross_pairs_found = len(valid_triangles)
+        cross_pairs_missing = total_possible - cross_pairs_found
+        logger.info(f"Cross-pair availability: {cross_pairs_found} found, {cross_pairs_missing} missing")
         logger.info(f"Pre-fetching depths for {len(existing_symbols)} unique symbols...")
 
         # Optional: start websocket bookTicker stream to reduce REST polling (only if dependency available)
