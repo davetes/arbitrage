@@ -1417,9 +1417,28 @@ def find_candidate_routes(
 
 def _parse_leg(label: str) -> Tuple[str, str, str]:
     """Parse leg label like "BTC/USDT buy" into (base, quote, side)"""
-    pair, side = label.split()
-    base, quote = pair.split("/")
-    return base, quote, side.lower()
+    try:
+        # Handle different formats: "BTC/USDT buy" or "BTC/USDT: buy" or "BTC/USDT buy/sell"
+        label = label.strip()
+        if ":" in label:
+            pair, side = label.split(":", 1)
+            pair = pair.strip()
+            side = side.strip()
+        else:
+            parts = label.split()
+            if len(parts) < 2:
+                raise ValueError(f"Invalid leg format: '{label}' - expected 'ASSET/QUOTE side'")
+            pair = parts[0]
+            side = parts[1]
+        
+        if "/" not in pair:
+            raise ValueError(f"Invalid pair format: '{pair}' - expected 'ASSET/QUOTE'")
+        
+        base, quote = pair.split("/")
+        return base.upper(), quote.upper(), side.lower()
+    except Exception as e:
+        logger.error(f"Error parsing leg '{label}': {e}")
+        raise
 
 
 def revalidate_route(route: CandidateRoute) -> Optional[CandidateRoute]:
@@ -1437,11 +1456,32 @@ def revalidate_route(route: CandidateRoute) -> Optional[CandidateRoute]:
         client = _client()
         symbols = _load_symbols(client)
         
-        # Re-run triangle check
-        new_route = _try_triangle(client, symbols, base, x, y)
+        # Use lenient profit thresholds for revalidation
+        # Allow routes that are still profitable (even if slightly lower than original)
+        # Use original profit as reference, but allow 50% lower (market may have moved)
+        original_profit = route.profit_pct
+        min_prof = max(0.01, original_profit * 0.5)  # At least 50% of original, minimum 0.01%
+        max_prof = 50.0  # Very high ceiling to catch any valid route
+        
+        # Re-run triangle check with lenient thresholds
+        new_route = _try_triangle(
+            client, 
+            symbols, 
+            base, 
+            x, 
+            y,
+            min_profit_pct=min_prof,
+            max_profit_pct=max_prof
+        )
+        
+        if new_route:
+            logger.info(f"Route revalidated: {x}/{base}->{y}/{x}->{y}/{base} profit={new_route.profit_pct:.4f}% (original={original_profit:.4f}%)")
+        else:
+            logger.warning(f"Route validation failed: {x}/{base}->{y}/{x}->{y}/{base} (original profit={original_profit:.4f}%)")
+        
         return new_route
     except Exception as e:
-        logger.error(f"Error revalidating route: {e}")
+        logger.error(f"Error revalidating route: {e}", exc_info=True)
         return None
 
 

@@ -414,15 +414,30 @@ async def main():
         if not r:
             await cb.answer(t("route_missing", lang), show_alert=True)
             return
-        cand = CandidateRoute(a=r.leg_a, b=r.leg_b, c=r.leg_c, profit_pct=r.profit_pct, volume_usd=r.volume_usd)
-        new_cand = revalidate_route(cand)
-        if not new_cand:
-            await cb.answer(t("not_valid", lang), show_alert=True)
-        else:
-            logging.info(f"Route {route_id} revalidated: profit={new_cand.profit_pct}% volume=${new_cand.volume_usd}")
-            text = f"Route: {new_cand.a} → {new_cand.b} → {new_cand.c}\nProfit: {new_cand.profit_pct:.2f}%\nVolume: ${new_cand.volume_usd:,.0f}"
-            await cb.message.edit_text(text, reply_markup=kb_route(route_id, lang))
-            await cb.answer(t("revalidated", lang))
+        
+        try:
+            cand = CandidateRoute(a=r.leg_a, b=r.leg_b, c=r.leg_c, profit_pct=r.profit_pct, volume_usd=r.volume_usd)
+            new_cand = revalidate_route(cand)
+            if not new_cand:
+                # Provide more informative error message
+                error_msg = t("not_valid", lang)
+                # Try to get more details about why validation failed
+                try:
+                    from apps.core.arbitrage import _parse_leg
+                    a_base, a_quote, _ = _parse_leg(r.leg_a)
+                    c_base, c_quote, _ = _parse_leg(r.leg_c)
+                    error_msg = f"{error_msg}\nRoute: {a_base}/{a_quote} → {c_base}/{a_base} → {c_base}/{c_quote}\nOriginal profit: {r.profit_pct:.2f}%"
+                except Exception:
+                    pass
+                await cb.answer(error_msg, show_alert=True)
+            else:
+                logging.info(f"Route {route_id} revalidated: profit={new_cand.profit_pct}% volume=${new_cand.volume_usd}")
+                text = f"Route: {new_cand.a} → {new_cand.b} → {new_cand.c}\nProfit: {new_cand.profit_pct:.2f}%\nVolume: ${new_cand.volume_usd:,.0f}"
+                await cb.message.edit_text(text, reply_markup=kb_route(route_id, lang))
+                await cb.answer(t("revalidated", lang))
+        except Exception as e:
+            logging.error(f"Error checking route {route_id}: {e}", exc_info=True)
+            await cb.answer(f"Error: {str(e)[:100]}", show_alert=True)
 
     @dp.callback_query(F.data.startswith("exec:"))
     async def exec_route(cb: CallbackQuery):
@@ -434,10 +449,24 @@ async def main():
             await cb.answer(t("route_missing", lang), show_alert=True)
             return
         # Revalidate before execution
-        cand = CandidateRoute(a=r.leg_a, b=r.leg_b, c=r.leg_c, profit_pct=r.profit_pct, volume_usd=r.volume_usd)
-        new_cand = revalidate_route(cand)
-        if not new_cand:
-            await cb.answer(t("not_valid", lang), show_alert=True)
+        try:
+            cand = CandidateRoute(a=r.leg_a, b=r.leg_b, c=r.leg_c, profit_pct=r.profit_pct, volume_usd=r.volume_usd)
+            new_cand = revalidate_route(cand)
+            if not new_cand:
+                # Provide more informative error message
+                error_msg = t("not_valid", lang)
+                try:
+                    from apps.core.arbitrage import _parse_leg
+                    a_base, a_quote, _ = _parse_leg(r.leg_a)
+                    c_base, c_quote, _ = _parse_leg(r.leg_c)
+                    error_msg = f"{error_msg}\nRoute: {a_base}/{a_quote} → {c_base}/{a_base} → {c_base}/{c_quote}\nOriginal profit: {r.profit_pct:.2f}%\nMarket may have moved or route no longer profitable."
+                except Exception:
+                    pass
+                await cb.answer(error_msg, show_alert=True)
+                return
+        except Exception as e:
+            logging.error(f"Error revalidating route {route_id} for execution: {e}", exc_info=True)
+            await cb.answer(f"Validation error: {str(e)[:100]}", show_alert=True)
             return
         
         # Calculate executable amount
