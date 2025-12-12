@@ -409,52 +409,43 @@ def _try_triangle(
     }
 
     def evaluate_pattern(pat: Tuple[str, str, str]):
-        """Evaluate pattern using exact formulas from user specification."""
+        """Evaluate pattern using step-by-step method: start with 1.0, apply each trade."""
         legs = patterns[pat]
         executed_sides = []
-        prices = []
         steps = []
         
-        # Extract prices and build step descriptions
+        # Start with 1.0 in base asset
+        amount = 1.0
+        
+        # Process each trade step-by-step
         for (side_price, sym, depth, logical_side) in legs:
+            # Get correct price: ask for BUY, bid for SELL
             price = depth["ask_price"] if side_price == "ask" else depth["bid_price"]
+            
+            # Validate price
             if price <= 0 or not isinstance(price, (int, float)) or price > 1e10:
                 return None  # Invalid price
-            prices.append(price)
-            steps.append(f"{logical_side} {sym} @{price:.10f}")
+            
+            # Apply trade: BUY divides amount by price, SELL multiplies amount by price
+            amount_before = amount
+            if logical_side == "BUY":
+                amount = amount / price  # Spending current asset to buy next asset
+            else:  # SELL
+                amount = amount * price  # Selling current asset for next asset
+            
+            # Validate amount is reasonable
+            if amount <= 0 or amount > 1e20:
+                return None
+            
+            # Build step description
+            steps.append(f"{logical_side} {sym} @{price:.10f} | {amount_before:.10f}->{amount:.10f}")
             executed_sides.append(logical_side.lower())
         
-        # Calculate gross profit using exact formulas
-        # Pattern 1: BUY-BUY-SELL -> (1 ÷ Price₁) × (1 ÷ Price₂) × Price₃ - 1
-        # Pattern 2: BUY-SELL-SELL -> (1 ÷ Price₁) × Price₂ × Price₃ - 1
-        if pat == ("BUY", "BUY", "SELL"):
-            # Pattern 1: BUY-BUY-SELL
-            # Price₁ = Ask price of X/base (BUY X with base)
-            # Price₂ = Ask price of Y/X (BUY Y with X)
-            # Price₃ = Bid price of Y/base (SELL Y for base)
-            price1, price2, price3 = prices[0], prices[1], prices[2]
-            gross_final_amount = (1.0 / price1) * (1.0 / price2) * price3
-        elif pat == ("BUY", "SELL", "SELL"):
-            # Pattern 2: BUY-SELL-SELL
-            # Price₁ = Ask price of X/base (BUY X with base)
-            # Price₂ = Bid price of X/Y (SELL X for Y) - note: might be inverted
-            # Price₃ = Bid price of Y/base (SELL Y for base)
-            price1, price2, price3 = prices[0], prices[1], prices[2]
-            gross_final_amount = (1.0 / price1) * price2 * price3
-        else:
-            return None
-        
-        # Calculate gross profit percentage
-        gross_profit_pct = (gross_final_amount - 1.0) * 100.0
+        # Calculate gross profit percentage: (final_amount - 1.0) * 100.0
+        gross_profit_pct = (amount - 1.0) * 100.0
         
         # Validate profit is reasonable (between -100% and 1000%)
-        # But allow slightly wider range for debugging (up to 10% to catch edge cases)
         if gross_profit_pct < -100 or gross_profit_pct > 1000:
-            return None
-        
-        # Additional validation: check for obviously wrong calculations
-        # If any price is extremely small or large, the calculation might be wrong
-        if any(p < 1e-10 or p > 1e10 for p in prices):
             return None
         
         return {
