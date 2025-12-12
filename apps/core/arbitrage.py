@@ -416,14 +416,39 @@ def _select_all_assets(
     symbols: Dict[str, dict],
     quotes: List[str],
 ) -> Tuple[List[str], Dict[str, float]]:
-    """Load ALL assets that trade with major quotes (2000+ symbols)"""
+    """
+    Load ALL assets that trade with major quotes (2000+ symbols).
+    First extracts all tradable assets from symbols dict, then uses ticker data only for volume ranking.
+    """
+    quotes_upper = {q.upper() for q in quotes}
+    assets_set = set()
+    volumes = {}
+    
+    # STEP 1: Extract ALL assets from symbols dict first (primary source)
+    for sym, info in symbols.items():
+        if info.get("status") != "TRADING":
+            continue
+        quote = info.get("quoteAsset", "").upper()
+        if quote not in quotes_upper:
+            continue
+        base_asset = info.get("baseAsset", "").upper()
+        if base_asset and base_asset != quote:
+            assets_set.add(base_asset)
+            # Initialize volume to 0, will be updated from ticker data if available
+            volumes[base_asset] = volumes.get(base_asset, 0.0)
+    
+    logger.info(f"Extracted {len(assets_set)} assets from symbols dict")
+    
+    # STEP 2: Use ticker data ONLY for volume ranking (not for asset discovery)
     try:
         stats = client.ticker_24hr()
-    except Exception:
-        # Fallback: extract from symbols dict
-        quotes_upper = {q.upper() for q in quotes}
-        assets = set()
-        volumes = {}
+        ticker_symbol_map = {}
+        for s in stats:
+            sym = s.get("symbol", "").upper()
+            if sym:
+                ticker_symbol_map[sym] = s
+        
+        # Update volumes from ticker data for assets we already found
         for sym, info in symbols.items():
             if info.get("status") != "TRADING":
                 continue
@@ -431,38 +456,23 @@ def _select_all_assets(
             if quote not in quotes_upper:
                 continue
             base_asset = info.get("baseAsset", "").upper()
-            if base_asset and base_asset != quote:
-                assets.add(base_asset)
-                volumes[base_asset] = volumes.get(base_asset, 0.0)
-        return list(assets), volumes
-
-    quotes_upper = {q.upper() for q in quotes}
-    vol_by_asset: Dict[str, float] = {}
-    assets_set = set()
-
-    # Extract ALL assets that trade with major quotes
-    for s in stats:
-        sym = s.get("symbol")
-        if not sym or sym not in symbols:
-            continue
-        info = symbols[sym]
-        if info.get("status") != "TRADING":
-            continue
-        quote = info.get("quoteAsset", "").upper()
-        if quote not in quotes_upper:
-            continue
-        base_asset = info.get("baseAsset", "").upper()
-        if not base_asset or base_asset == quote:
-            continue
-        assets_set.add(base_asset)
-        try:
-            vol = float(s.get("quoteVolume", 0))
-            vol_by_asset[base_asset] = max(vol_by_asset.get(base_asset, 0.0), vol)
-        except Exception:
-            continue
-
-    # Return all assets (2000+)
-    return list(assets_set), vol_by_asset
+            if base_asset and base_asset != quote and base_asset in assets_set:
+                # Get volume from ticker data if available
+                ticker_data = ticker_symbol_map.get(sym.upper())
+                if ticker_data:
+                    try:
+                        vol = float(ticker_data.get("quoteVolume", 0))
+                        # Keep maximum volume across all quote pairs for this asset
+                        volumes[base_asset] = max(volumes.get(base_asset, 0.0), vol)
+                    except Exception:
+                        pass
+        
+        logger.info(f"Updated volumes for {len([v for v in volumes.values() if v > 0])} assets from ticker data")
+    except Exception as e:
+        logger.warning(f"Failed to fetch ticker data for volume ranking: {e}. Using symbols-only data.")
+    
+    # Return all assets (2000+) with volumes
+    return list(assets_set), volumes
 
 
 def _depth_snapshot(client: BinanceClient, symbol: str, depth: int = 20, use_cache: bool = True) -> Optional[dict]:
@@ -1049,9 +1059,21 @@ def find_candidate_routes(
         
         logger.info(f"Using {len(universe)} assets with {sum(len(v) for v in asset_quote_map.values())} quote pairs")
         
-        # Generate and score all triangles efficiently
+        # Generate and score all triangles efficiently with strict deduplication
         all_triangles = []
-        triangle_set = set()  # Track unique triangles
+        triangle_set = set()  # Track unique triangles using sorted tuple keys (x, y)
+        duplicates_found = 0
+        
+        def add_triangle(x: str, y: str, score: float, require_int: bool, pattern: str = ""):
+            """Helper to add triangle with strict deduplication"""
+            # Use sorted tuple for strict deduplication (order-independent)
+            key = tuple(sorted([x.upper(), y.upper()]))
+            if key in triangle_set:
+                duplicates_found += 1
+                return False
+            triangle_set.add(key)
+            all_triangles.append((score, x, y, require_int))
+            return True
         
         # Pattern 1: Major-to-major (highest priority) - require intermediate
         major_assets_list = ["BTC", "ETH", "BNB"]
@@ -1070,13 +1092,10 @@ def find_candidate_routes(
                     has_cross = ((cross1 in symbols and symbols[cross1].get("status") == "TRADING") or
                                  (cross2 in symbols and symbols[cross2].get("status") == "TRADING"))
                     
-                    key = tuple(sorted([major1, major2]))
-                    if key not in triangle_set:
-                        triangle_set.add(key)
-                        score = _score_triangle(major1, major2, base, asset_volumes, asset_quote_map)
-                        if has_cross:
-                            score += 100.0  # Bonus for having cross pair
-                        all_triangles.append((score, major1, major2, True))  # True = require intermediate
+                    score = _score_triangle(major1, major2, base, asset_volumes, asset_quote_map)
+                    if has_cross:
+                        score += 100.0  # Bonus for having cross pair
+                    add_triangle(major1, major2, score, True, "major-to-major")
         
         # Pattern 2: Major routing (require intermediate for major assets)
         for asset in universe:
@@ -1092,13 +1111,10 @@ def find_candidate_routes(
                 if major == base or major == asset:
                     continue
                 if major in asset_quotes:
-                    key = tuple(sorted([major, asset]))
-                    if key not in triangle_set:
-                        triangle_set.add(key)
-                        score = _score_triangle(major, asset, base, asset_volumes, asset_quote_map)
-                        # Major assets require intermediate pair
-                        require_int = major in MAJOR_ASSETS or asset in MAJOR_ASSETS
-                        all_triangles.append((score, major, asset, require_int))
+                    # Major assets require intermediate pair
+                    require_int = major in MAJOR_ASSETS or asset in MAJOR_ASSETS
+                    score = _score_triangle(major, asset, base, asset_volumes, asset_quote_map)
+                    add_triangle(major, asset, score, require_int, "major-routing")
         
         # Pattern 3: Direct triangles (intermediate optional for non-major)
         # Only check pairs that both trade with base
@@ -1108,7 +1124,7 @@ def find_candidate_routes(
         base_trading_assets.sort(key=lambda a: asset_volumes.get(a, 0.0), reverse=True)
         
         # Limit direct triangle checks to top pairs to avoid explosion
-        max_direct_checks = getattr(S, "MAX_DIRECT_TRIANGLES", 5000)
+        max_direct_checks = getattr(S, "MAX_DIRECT_TRIANGLES", 10000)  # Increased limit
         checked_pairs = 0
         
         for i, asset in enumerate(base_trading_assets):
@@ -1119,16 +1135,16 @@ def find_candidate_routes(
                     break
                 checked_pairs += 1
                 
-                key = tuple(sorted([asset, other_asset]))
-                if key not in triangle_set:
-                    triangle_set.add(key)
-                    # For non-major assets, intermediate is optional
-                    require_int = asset in MAJOR_ASSETS or other_asset in MAJOR_ASSETS
-                    score = _score_triangle(asset, other_asset, base, asset_volumes, asset_quote_map)
-                    # Lower score for non-major pairs without intermediate
-                    if not require_int:
-                        score *= 0.5
-                    all_triangles.append((score, asset, other_asset, require_int))
+                # For non-major assets, intermediate is optional
+                require_int = asset in MAJOR_ASSETS or other_asset in MAJOR_ASSETS
+                score = _score_triangle(asset, other_asset, base, asset_volumes, asset_quote_map)
+                # Lower score for non-major pairs without intermediate
+                if not require_int:
+                    score *= 0.5
+                add_triangle(asset, other_asset, score, require_int, "direct")
+        
+        if duplicates_found > 0:
+            logger.info(f"Filtered {duplicates_found} duplicate triangles during generation")
         
         # Sort by score (highest first)
         all_triangles.sort(reverse=True)
