@@ -2,9 +2,9 @@ from dataclasses import dataclass
 from typing import List, Optional, Dict, Tuple
 from binance.spot import Spot as BinanceClient
 try:
-    from binance.websocket.spot.websocket_client import SpotWebsocketClient
+    from binance.websocket.websocket_client import BinanceWebsocketClient
 except Exception:  # Dependency may be missing in some deployments
-    SpotWebsocketClient = None
+    BinanceWebsocketClient = None
 from arbbot import settings as S
 from .symbol_loader import get_symbol_loader
 import time
@@ -47,42 +47,69 @@ _depth_cache = DepthCache(ttl_seconds=2.0)
 
 
 class _BookTickerStream:
-    """Websocket-based best bid/ask cache with persistent connection and combined streams."""
+    """
+    WebSocket-based best bid/ask cache using BinanceWebsocketClient (binance-connector 3.6.0).
+    Implements combined streams following official Binance WebSocket API.
+    Based on: https://binance-docs.github.io/apidocs/spot/en/#websocket-market-streams
+    """
 
     def __init__(self, ttl_seconds: float = 5.0):
         self.ttl = ttl_seconds
-        self.client: Optional[SpotWebsocketClient] = None
+        self.client: Optional[BinanceWebsocketClient] = None
         self.lock = threading.Lock()
         self.cache: Dict[str, Tuple[dict, float]] = {}
         self.running = False
         self.subscribed_symbols: set = set()
         self.last_reconnect_time = 0.0
-        self.reconnect_interval = 300.0  # Reconnect every 5 minutes to prevent stale connections
-        self._reconnect_thread: Optional[threading.Thread] = None
-        self._stop_reconnect = False
+        self.reconnect_interval = 82800.0  # Reconnect before 24 hour limit (23 hours)
+        self._base_url = "wss://stream.binance.com:9443"  # Official base endpoint
 
     def _on_message(self, _, message: str):
+        """
+        Handle WebSocket messages according to Binance API:
+        - Combined stream format: {"stream": "btcusdt@bookTicker", "data": {...}}
+        - Single stream format: {"s": "BTCUSDT", "b": "...", ...}
+        - Control messages: {"result": ..., "id": ...}
+        """
         try:
             data = json.loads(message)
             if not isinstance(data, dict):
                 return
             
-            # Handle both single stream and combined stream formats
-            # Combined stream format: {"stream": "btcusdt@bookTicker", "data": {...}}
-            # Single stream format: {"s": "BTCUSDT", "b": "...", ...}
+            # Handle control messages (subscribe/unsubscribe responses)
+            if "result" in data and "id" in data:
+                # This is a control message response, ignore
+                return
             
-            if "data" in data:
-                # Combined stream format
-                ticker_data = data["data"]
-                symbol = ticker_data.get("s") or ticker_data.get("symbol")
-            else:
-                # Single stream format
+            # Handle combined stream format: {"stream": "btcusdt@bookTicker", "data": {...}}
+            if "stream" in data and "data" in data:
+                stream_name = data.get("stream", "")
+                if "@bookTicker" in stream_name:
+                    ticker_data = data["data"]
+                    symbol = ticker_data.get("s") or ticker_data.get("symbol")
+                    self._process_book_ticker(symbol, ticker_data)
+                return
+            
+            # Handle single stream format (raw stream)
+            # Check if it's a bookTicker message
+            if "s" in data and ("b" in data or "a" in data):
                 symbol = data.get("s") or data.get("symbol")
-                ticker_data = data
-            
-            if not symbol:
+                self._process_book_ticker(symbol, data)
                 return
                 
+        except Exception as e:
+            logger.debug(f"Error processing WebSocket message: {e}")
+            return
+    
+    def _process_book_ticker(self, symbol: str, ticker_data: dict):
+        """Process bookTicker data according to Binance API format"""
+        if not symbol:
+            return
+        
+        # Binance bookTicker format:
+        # {"u":400900217, "s":"BNBUSDT", "b":"25.35190000", "B":"31.21000000", 
+        #  "a":"25.36520000", "A":"40.66000000"}
+        try:
             bid_price = float(ticker_data.get("b", 0))
             bid_qty = float(ticker_data.get("B", 0))
             ask_price = float(ticker_data.get("a", 0))
@@ -103,14 +130,17 @@ class _BookTickerStream:
             }
             with self.lock:
                 self.cache[symbol.upper()] = (snapshot, time.time())
-        except Exception as e:
-            logger.debug(f"Error processing WebSocket message: {e}")
+        except (ValueError, TypeError) as e:
+            logger.debug(f"Error parsing bookTicker data for {symbol}: {e}")
             return
 
     def _ensure_connection(self, symbols: List[str], **kwargs):
-        """Ensure WebSocket connection is active and subscribed to required symbols"""
-        if SpotWebsocketClient is None:
-            logger.warning("SpotWebsocketClient unavailable; skipping websocket bookTicker startup.")
+        """
+        Ensure WebSocket connection is active and subscribed to required symbols.
+        Uses BinanceWebsocketClient which starts automatically upon instantiation.
+        """
+        if BinanceWebsocketClient is None:
+            logger.warning("BinanceWebsocketClient unavailable; skipping websocket bookTicker startup.")
             return False
         
         symbols_set = {s.upper() for s in symbols}
@@ -134,35 +164,46 @@ class _BookTickerStream:
                 self.stop()
                 time.sleep(0.2)  # Brief pause for cleanup
             
-            # Use combined stream format for efficiency (up to 200 streams per connection)
+            # Use combined stream format for efficiency (up to 1024 streams per connection per Binance API)
             # Binance format: wss://stream.binance.com:9443/stream?streams=btcusdt@bookTicker/ethusdt@bookTicker/...
             stream_symbols = [s.lower() for s in symbols]
             
-            # Binance allows up to 200 streams per combined stream
-            # Split into chunks if needed
-            max_streams_per_connection = 200
+            # Binance allows up to 1024 streams per combined stream (per official API)
+            max_streams_per_connection = 1024
             if len(stream_symbols) <= max_streams_per_connection:
                 # Single connection for all symbols using combined stream
                 streams = "/".join([f"{sym}@bookTicker" for sym in stream_symbols])
                 # Use combined stream endpoint
-                combined_url = f"wss://stream.binance.com:9443/stream?streams={streams}"
-                kwargs_with_url = {**kwargs, "stream_url": combined_url}
-                self.client = SpotWebsocketClient(on_message=self._on_message, **kwargs_with_url)
-                self.client.start()
+                combined_url = f"{self._base_url}/stream?streams={streams}"
+                
+                # BinanceWebsocketClient starts automatically upon instantiation
+                # Pass stream_url and on_message callback
+                self.client = BinanceWebsocketClient(
+                    stream_url=combined_url,
+                    on_message=self._on_message,
+                    **kwargs
+                )
+                # No need to call start() - client starts automatically
                 
                 self.subscribed_symbols = symbols_set
                 self.running = True
                 self.last_reconnect_time = now
-                logger.info(f"WebSocket connected: {len(stream_symbols)} symbols via combined stream")
+                logger.info(f"WebSocket connected: {len(stream_symbols)} symbols via combined stream (max 1024)")
             else:
-                # Multiple connections for large symbol sets - use first 200 (highest priority)
+                # Multiple connections for large symbol sets - use first 1024 (highest priority)
                 logger.info(f"Large symbol set ({len(stream_symbols)}), using top {max_streams_per_connection} symbols")
                 limited_symbols = stream_symbols[:max_streams_per_connection]
                 streams = "/".join([f"{sym}@bookTicker" for sym in limited_symbols])
-                combined_url = f"wss://stream.binance.com:9443/stream?streams={streams}"
-                kwargs_with_url = {**kwargs, "stream_url": combined_url}
-                self.client = SpotWebsocketClient(on_message=self._on_message, **kwargs_with_url)
-                self.client.start()
+                combined_url = f"{self._base_url}/stream?streams={streams}"
+                
+                # BinanceWebsocketClient starts automatically upon instantiation
+                self.client = BinanceWebsocketClient(
+                    stream_url=combined_url,
+                    on_message=self._on_message,
+                    **kwargs
+                )
+                # No need to call start() - client starts automatically
+                
                 self.subscribed_symbols = {s.upper() for s in limited_symbols}
                 self.running = True
                 self.last_reconnect_time = now
@@ -1193,7 +1234,7 @@ def find_candidate_routes(
         logger.info(f"Symbol optimization: {len(required_symbols)} symbols needed (limit: {max_symbols_to_fetch})")
 
         # Start/update WebSocket connection (persistent, only updates subscriptions if needed)
-        use_ws = getattr(S, "USE_BOOK_TICKER_WS", True) and SpotWebsocketClient is not None
+        use_ws = getattr(S, "USE_BOOK_TICKER_WS", True) and BinanceWebsocketClient is not None
         if use_ws and required_symbols:
             try:
                 stream_url = getattr(S, "BINANCE_WS_URL", None)
@@ -1213,7 +1254,7 @@ def find_candidate_routes(
             except Exception as e:
                 logger.warning(f"WebSocket startup failed, using REST only: {e}")
                 use_ws = False
-        elif getattr(S, "USE_BOOK_TICKER_WS", True) and SpotWebsocketClient is None:
+        elif getattr(S, "USE_BOOK_TICKER_WS", True) and BinanceWebsocketClient is None:
             logger.warning("WebSocket client not available, install binance-connector-python[websocket]")
         
         # Fetch market data with WebSocket priority (minimal REST calls)
