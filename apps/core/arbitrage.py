@@ -612,7 +612,7 @@ def find_candidate_routes(
         allowed_quotes = getattr(S, "ALLOWED_QUOTES", ["USDT", "BTC", "ETH", "BNB", "FDUSD", "USDC"])
         if base not in allowed_quotes:
             allowed_quotes.append(base)
-        max_assets = getattr(S, "MAX_ASSETS", 150)
+        max_assets = getattr(S, "MAX_ASSETS", 80)  # Reduced from 150 to 80 for better efficiency
         logger.info(
             f"Loaded {len(symbols)} symbols, base={base}, profit range: {min_profit_pct}% - {max_profit_pct}%, "
             f"quotes={allowed_quotes}, max_assets={max_assets}"
@@ -641,26 +641,35 @@ def find_candidate_routes(
         
         universe = [asset for asset in universe if asset != base][:max_assets]
         logger.info(f"Using {len(universe)} assets: {universe[:15]}...")
+        logger.info(f"Will check {len(universe) * (len(universe) - 1) // 2} unique triangles (reduced from {len(universe) * (len(universe) - 1)} by checking only j > i)")
         
         # Step 1: Collect symbols needed for triangles
         # For triangle base -> X -> Y -> base, we need:
         # 1. Xbase (e.g., BTCUSDT)
-        # 2. YX (e.g., ETHBTC)
+        # 2. YX (e.g., ETHBTC) or XY (e.g., BTCETH)
         # 3. Ybase (e.g., ETHUSDT)
         
         needed_symbols = set()
         
-        # Add base pairs for each asset
+        # Add base pairs for each asset (only if they exist)
         for asset in universe:
-            needed_symbols.add(f"{asset}{base}")  # Xbase
+            symbol_base = f"{asset}{base}"
+            if symbol_base in symbols:
+                needed_symbols.add(symbol_base)  # Xbase
         
-        # Add cross pairs in YX format
+        # Add cross pairs - check both YX and XY formats, only add if they exist
         for i, x in enumerate(universe):
             for y in universe[i + 1:]:
-                needed_symbols.add(f"{y}{x}")  # YX format (e.g., ETHBTC, not BTCETH)
+                symbol_yx = f"{y}{x}"  # YX format (e.g., ETHBTC)
+                symbol_xy = f"{x}{y}"   # XY format (e.g., BTCETH)
+                # Only add if at least one format exists
+                if symbol_yx in symbols:
+                    needed_symbols.add(symbol_yx)
+                elif symbol_xy in symbols:
+                    needed_symbols.add(symbol_xy)
         
-        # Filter to existing symbols
-        existing_symbols = [s for s in needed_symbols if s in symbols]
+        # All symbols in needed_symbols are guaranteed to exist
+        existing_symbols = list(needed_symbols)
         logger.info(f"Pre-fetching depths for {len(existing_symbols)} unique symbols...")
 
         # Optional: start websocket bookTicker stream to reduce REST polling (only if dependency available)
@@ -706,11 +715,9 @@ def find_candidate_routes(
         # Define testnet tokens that can't pair directly
         testnet_tokens = {"0G", "PNUT", "WAL", "S", "ASTER", "LUNA", "EUR"}
         
-        # Check all unique asset pairs (both directions)
+        # Check only unique triangles (j > i to avoid duplicates)
         for i in range(len(universe)):
-            for j in range(len(universe)):
-                if i == j:
-                    continue  # Skip same asset
+            for j in range(i + 1, len(universe)):
                 checked += 1
                 
                 x = universe[i]
@@ -721,12 +728,20 @@ def find_candidate_routes(
                     stats["filtered_missing_pairs"] += 1
                     continue
                 
-                # Check if required pairs could exist
+                # Early check: verify required pairs exist before fetching depths
                 symbol1 = f"{x}{base}"  # Xbase (e.g., BTCUSDT)
                 symbol3 = f"{y}{base}"  # Ybase (e.g., ETHUSDT)
                 
                 if not (symbol1 in symbols and symbol3 in symbols):
                     stats["filtered_missing_pairs"] += 1
+                    # Log occasionally to show what pairs are missing
+                    if stats["filtered_missing_pairs"] <= 5 or random.random() < 0.0001:
+                        missing = []
+                        if symbol1 not in symbols:
+                            missing.append(symbol1)
+                        if symbol3 not in symbols:
+                            missing.append(symbol3)
+                        logger.debug(f"Missing base pairs for {x}/{y}: {missing}")
                     continue
                 
                 # Check intermediate pair in either direction
@@ -735,6 +750,9 @@ def find_candidate_routes(
                 
                 if not (symbol2_yx in symbols or symbol2_xy in symbols):
                     stats["filtered_missing_pairs"] += 1
+                    # Log occasionally
+                    if stats["filtered_missing_pairs"] <= 5 or random.random() < 0.0001:
+                        logger.debug(f"Missing cross pair for {x}/{y}: neither {symbol2_yx} nor {symbol2_xy} exists")
                     continue
                 
                 # Try the triangle
@@ -768,16 +786,28 @@ def find_candidate_routes(
         logger.info(f"Found {len(cand)} routes")
         logger.info(f"Filter stats: missing_pairs={stats['filtered_missing_pairs']}, profit={stats['filtered_profit']}, volume={stats['filtered_volume']}")
         
+        # Calculate efficiency metrics
+        if checked > 0:
+            missing_pct = (stats['filtered_missing_pairs'] / checked) * 100.0
+            profit_pct = (stats['filtered_profit'] / checked) * 100.0
+            logger.info(f"Efficiency: {missing_pct:.1f}% missing pairs, {profit_pct:.1f}% filtered by profit")
+        
         if stats.get("sample_profits"):
             profits = stats["sample_profits"]
             if profits:
                 logger.info(f"Profit sample (n={len(profits)}): min={min(profits):.6f}%, max={max(profits):.6f}%, avg={sum(profits)/len(profits):.6f}%")
+                # Show profit distribution
+                in_range = [p for p in profits if min_profit_pct <= p <= max_profit_pct]
+                if in_range:
+                    logger.info(f"  Routes in target range ({min_profit_pct:.1f}-{max_profit_pct:.1f}%): {len(in_range)}/{len(profits)}")
+                else:
+                    logger.warning(f"  No routes found in target range ({min_profit_pct:.1f}-{max_profit_pct:.1f}%)")
         
         # Log routes that were close to target range
         if stats.get("close_routes"):
             close_routes = stats["close_routes"]
             logger.info(f"Found {len(close_routes)} routes close to target range (0.5-6.0%):")
-            for cr in close_routes[:3]:  # Show first 3
+            for cr in close_routes[:5]:  # Show first 5
                 logger.info(f"  {cr['route']}: {cr['gross']:.4f}% gross ({cr['net']:.4f}% net) pattern={cr['pattern']}")
         
         # Sort by profit desc and return top 5
