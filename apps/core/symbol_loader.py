@@ -60,7 +60,8 @@ class FastSymbolLoader:
         include_all_pairs: bool = False
     ) -> Dict[str, dict]:
         """
-        Filter symbols and extract only needed fields
+        Filter symbols and extract only needed fields.
+        Filters out invalid pairs (e.g., USDT:USDT) and ensures comprehensive coverage.
         
         Args:
             exchange_info: Full exchange_info response from Binance
@@ -76,22 +77,31 @@ class FastSymbolLoader:
         major_assets.add(base_upper)  # Include base asset
         # Bridge quotes we want to keep to build triangles: include common quotes
         bridge_quotes = {base_upper, "BTC", "ETH", "BNB", "FDUSD", "USDC"}
+        invalid_count = 0
         
         for symbol_data in exchange_info.get("symbols", []):
             # Only include TRADING symbols
             if symbol_data.get("status") != "TRADING":
                 continue
             
-            symbol = symbol_data.get("symbol", "")
-            base_asset_symbol = symbol_data.get("baseAsset", "").upper()
-            quote_asset_symbol = symbol_data.get("quoteAsset", "").upper()
+            symbol = symbol_data.get("symbol", "").strip()
+            if not symbol:
+                continue
+            
+            base_asset_symbol = symbol_data.get("baseAsset", "").upper().strip()
+            quote_asset_symbol = symbol_data.get("quoteAsset", "").upper().strip()
+            
+            # Filter out invalid pairs where base == quote (e.g., USDT:USDT)
+            if not base_asset_symbol or not quote_asset_symbol or base_asset_symbol == quote_asset_symbol:
+                invalid_count += 1
+                continue
             
             if include_all_pairs:
-                # Include all trading pairs (status already checked)
+                # Include all trading pairs (status already checked, invalid pairs filtered)
                 filtered[symbol] = {
                     "symbol": symbol,
-                    "baseAsset": symbol_data.get("baseAsset", ""),
-                    "quoteAsset": symbol_data.get("quoteAsset", ""),
+                    "baseAsset": base_asset_symbol,
+                    "quoteAsset": quote_asset_symbol,
                     "status": symbol_data.get("status", "TRADING")
                 }
             else:
@@ -100,10 +110,13 @@ class FastSymbolLoader:
                 if quote_asset_symbol in bridge_quotes:
                     filtered[symbol] = {
                         "symbol": symbol,
-                        "baseAsset": symbol_data.get("baseAsset", ""),
-                        "quoteAsset": symbol_data.get("quoteAsset", ""),
+                        "baseAsset": base_asset_symbol,
+                        "quoteAsset": quote_asset_symbol,
                         "status": symbol_data.get("status", "TRADING")
                     }
+        
+        if invalid_count > 0:
+            logger.debug(f"Filtered out {invalid_count} invalid pairs (baseAsset == quoteAsset)")
         
         return filtered
     

@@ -45,27 +45,55 @@ class DepthCache:
 # Global depth cache instance (2 second TTL)
 _depth_cache = DepthCache(ttl_seconds=2.0)
 
+# Global WebSocket stream instance with persistent connection
+_book_ticker_stream = _BookTickerStream(ttl_seconds=5.0)  # Increased TTL for better cache hit rate
+
 
 class _BookTickerStream:
-    """Websocket-based best bid/ask cache."""
+    """Websocket-based best bid/ask cache with persistent connection and combined streams."""
 
-    def __init__(self, ttl_seconds: float = 2.0):
+    def __init__(self, ttl_seconds: float = 5.0):
         self.ttl = ttl_seconds
         self.client: Optional[SpotWebsocketClient] = None
         self.lock = threading.Lock()
         self.cache: Dict[str, Tuple[dict, float]] = {}
         self.running = False
+        self.subscribed_symbols: set = set()
+        self.last_reconnect_time = 0.0
+        self.reconnect_interval = 300.0  # Reconnect every 5 minutes to prevent stale connections
+        self._reconnect_thread: Optional[threading.Thread] = None
+        self._stop_reconnect = False
 
     def _on_message(self, _, message: str):
         try:
             data = json.loads(message)
             if not isinstance(data, dict):
                 return
-            symbol = data.get("s") or data.get("symbol")
-            bid_price = float(data.get("b"))
-            bid_qty = float(data.get("B"))
-            ask_price = float(data.get("a"))
-            ask_qty = float(data.get("A"))
+            
+            # Handle both single stream and combined stream formats
+            # Combined stream format: {"stream": "btcusdt@bookTicker", "data": {...}}
+            # Single stream format: {"s": "BTCUSDT", "b": "...", ...}
+            
+            if "data" in data:
+                # Combined stream format
+                ticker_data = data["data"]
+                symbol = ticker_data.get("s") or ticker_data.get("symbol")
+            else:
+                # Single stream format
+                symbol = data.get("s") or data.get("symbol")
+                ticker_data = data
+            
+            if not symbol:
+                return
+                
+            bid_price = float(ticker_data.get("b", 0))
+            bid_qty = float(ticker_data.get("B", 0))
+            ask_price = float(ticker_data.get("a", 0))
+            ask_qty = float(ticker_data.get("A", 0))
+            
+            if bid_price <= 0 or ask_price <= 0:
+                return
+                
             snapshot = {
                 "ask_price": ask_price,
                 "ask_qty": ask_qty,
@@ -78,45 +106,123 @@ class _BookTickerStream:
             }
             with self.lock:
                 self.cache[symbol.upper()] = (snapshot, time.time())
-        except Exception:
+        except Exception as e:
+            logger.debug(f"Error processing WebSocket message: {e}")
             return
 
-    def start(self, symbols: List[str], **kwargs):
-        """Start bookTicker websocket for given symbols (idempotent)."""
-        if self.running:
-            return
+    def _ensure_connection(self, symbols: List[str], **kwargs):
+        """Ensure WebSocket connection is active and subscribed to required symbols"""
         if SpotWebsocketClient is None:
             logger.warning("SpotWebsocketClient unavailable; skipping websocket bookTicker startup.")
+            return False
+        
+        symbols_set = {s.upper() for s in symbols}
+        needs_update = not self.running or symbols_set != self.subscribed_symbols
+        
+        # Check if reconnection is needed (prevent stale connections)
+        now = time.time()
+        needs_reconnect = (now - self.last_reconnect_time) > self.reconnect_interval
+        
+        if needs_reconnect and self.running:
+            logger.info("Reconnecting WebSocket to prevent stale connection...")
+            self.stop()
+            needs_update = True
+        
+        if not needs_update:
+            return True
+        
+        try:
+            # Stop existing connection if running
+            if self.running:
+                self.stop()
+                time.sleep(0.2)  # Brief pause for cleanup
+            
+            # Use combined stream format for efficiency (up to 200 streams per connection)
+            # Binance format: wss://stream.binance.com:9443/stream?streams=btcusdt@bookTicker/ethusdt@bookTicker/...
+            stream_symbols = [s.lower() for s in symbols]
+            
+            # Binance allows up to 200 streams per combined stream
+            # Split into chunks if needed
+            max_streams_per_connection = 200
+            if len(stream_symbols) <= max_streams_per_connection:
+                # Single connection for all symbols using combined stream
+                streams = "/".join([f"{sym}@bookTicker" for sym in stream_symbols])
+                # Use combined stream endpoint
+                combined_url = f"wss://stream.binance.com:9443/stream?streams={streams}"
+                kwargs_with_url = {**kwargs, "stream_url": combined_url}
+                self.client = SpotWebsocketClient(on_message=self._on_message, **kwargs_with_url)
+                self.client.start()
+                
+                self.subscribed_symbols = symbols_set
+                self.running = True
+                self.last_reconnect_time = now
+                logger.info(f"WebSocket connected: {len(stream_symbols)} symbols via combined stream")
+            else:
+                # Multiple connections for large symbol sets - use first 200 (highest priority)
+                logger.info(f"Large symbol set ({len(stream_symbols)}), using top {max_streams_per_connection} symbols")
+                limited_symbols = stream_symbols[:max_streams_per_connection]
+                streams = "/".join([f"{sym}@bookTicker" for sym in limited_symbols])
+                combined_url = f"wss://stream.binance.com:9443/stream?streams={streams}"
+                kwargs_with_url = {**kwargs, "stream_url": combined_url}
+                self.client = SpotWebsocketClient(on_message=self._on_message, **kwargs_with_url)
+                self.client.start()
+                self.subscribed_symbols = {s.upper() for s in limited_symbols}
+                self.running = True
+                self.last_reconnect_time = now
+                logger.info(f"WebSocket connected: {len(limited_symbols)} symbols (limited to {max_streams_per_connection})")
+            
+            return True
+        except Exception as e:
+            logger.error(f"Failed to start WebSocket: {e}", exc_info=True)
+            self.running = False
+            return False
+
+    def start(self, symbols: List[str], **kwargs):
+        """Start or update bookTicker websocket subscriptions (keeps connection alive)."""
+        if not symbols:
             return
-        # Binance expects lowercase symbols for stream names.
-        stream_symbols = [s.lower() for s in symbols]
-        self.client = SpotWebsocketClient(on_message=self._on_message, **kwargs)
-        self.client.start()
-        for sym in stream_symbols:
-            self.client.book_ticker(symbol=sym)
-        self.running = True
+        
+        self._ensure_connection(symbols, **kwargs)
 
     def stop(self):
+        """Stop websocket connection"""
         if self.client:
             try:
                 self.client.stop()
             except Exception:
                 pass
         self.running = False
+        self.client = None
 
     def get(self, symbol: str) -> Optional[dict]:
+        """Get cached ticker data if available and fresh"""
         now = time.time()
         with self.lock:
-            if symbol.upper() in self.cache:
-                data, ts = self.cache[symbol.upper()]
+            symbol_upper = symbol.upper()
+            if symbol_upper in self.cache:
+                data, ts = self.cache[symbol_upper]
                 if now - ts < self.ttl:
                     return data
                 else:
-                    del self.cache[symbol.upper()]
+                    # Data expired, remove from cache
+                    del self.cache[symbol_upper]
         return None
+    
+    def get_coverage(self, symbols: List[str]) -> Tuple[int, int]:
+        """Get WebSocket coverage stats"""
+        now = time.time()
+        with self.lock:
+            valid_count = 0
+            for sym in symbols:
+                sym_upper = sym.upper()
+                if sym_upper in self.cache:
+                    _, ts = self.cache[sym_upper]
+                    if now - ts < self.ttl:
+                        valid_count += 1
+            return valid_count, len(symbols)
 
 
-_book_ticker_stream = _BookTickerStream(ttl_seconds=2.0)
+# _book_ticker_stream is now defined above after DepthCache
 
 
 @dataclass
@@ -188,22 +294,85 @@ def _client(timeout: int = None) -> BinanceClient:
 
 
 def _load_symbols(client: BinanceClient) -> Dict[str, dict]:
-    """Load ALL symbols from Binance exchange info (full market coverage)"""
+    """
+    Load all active spot markets with target quotes (USDT, BTC, ETH, BNB, FDUSD, USDC).
+    Filters out invalid pairs (e.g., USDT:USDT) and ensures comprehensive coverage.
+    Target: ~2,200+ symbols total.
+    """
+    # Target quotes for arbitrage opportunities
+    TARGET_QUOTES = {"USDT", "BTC", "ETH", "BNB", "FDUSD", "USDC"}
+    
     try:
-        # Force full symbol loading without filtering
         exchange_info = client.exchange_info()
         symbols = {}
+        seen_symbols = set()  # Track to prevent duplicates
+        invalid_count = 0
+        filtered_count = 0
+        
         for symbol_info in exchange_info.get("symbols", []):
-            symbol = symbol_info.get("symbol")
-            if symbol and symbol_info.get("status") == "TRADING":
-                symbols[symbol] = symbol_info
-        logger.info(f"Loaded {len(symbols)} trading symbols from exchange")
+            symbol = symbol_info.get("symbol", "").strip()
+            if not symbol:
+                continue
+            
+            # Only include TRADING status (exclude BREAK, PRE_TRADING, etc.)
+            if symbol_info.get("status") != "TRADING":
+                continue
+            
+            # Extract base and quote assets
+            base_asset = symbol_info.get("baseAsset", "").upper().strip()
+            quote_asset = symbol_info.get("quoteAsset", "").upper().strip()
+            
+            # Filter out invalid pairs where base == quote (e.g., USDT:USDT)
+            if not base_asset or not quote_asset or base_asset == quote_asset:
+                invalid_count += 1
+                continue
+            
+            # Only include pairs with target quotes
+            if quote_asset not in TARGET_QUOTES:
+                filtered_count += 1
+                continue
+            
+            # Prevent duplicates (shouldn't happen, but safety check)
+            if symbol in seen_symbols:
+                logger.warning(f"Duplicate symbol detected: {symbol}")
+                continue
+            
+            seen_symbols.add(symbol)
+            
+            # Store minimal symbol info for efficiency
+            symbols[symbol] = {
+                "symbol": symbol,
+                "baseAsset": base_asset,
+                "quoteAsset": quote_asset,
+                "status": "TRADING"
+            }
+        
+        logger.info(
+            f"Loaded {len(symbols)} active spot markets with quotes {sorted(TARGET_QUOTES)} "
+            f"(filtered {filtered_count} non-target quotes, {invalid_count} invalid pairs)"
+        )
+        
+        # Log breakdown by quote
+        quote_counts = {}
+        for sym_info in symbols.values():
+            quote = sym_info.get("quoteAsset", "UNKNOWN")
+            quote_counts[quote] = quote_counts.get(quote, 0) + 1
+        
+        logger.info(f"Symbol breakdown by quote: {dict(sorted(quote_counts.items()))}")
+        
         return symbols
+        
     except Exception as e:
-        logger.error(f"Failed to load symbols: {e}")
-        # Fallback to loader
+        logger.error(f"Failed to load symbols: {e}", exc_info=True)
+        # Fallback to symbol loader
+        logger.info("Falling back to FastSymbolLoader")
         loader = get_symbol_loader(cache_ttl_seconds=300)
-        return loader.load_symbols(client, base_asset=S.BASE_ASSET, use_cache=True, include_all_pairs=True)
+        return loader.load_symbols(
+            client, 
+            base_asset=S.BASE_ASSET, 
+            use_cache=True, 
+            include_all_pairs=False  # Use filtered mode to get target quotes only
+        )
 
 
 def _top_assets_by_quote_volume(
@@ -370,24 +539,41 @@ def _fetch_depth_parallel(client: BinanceClient, symbols: List[str], max_workers
         return results
     
     # Fetch remaining via REST with optimized rate limiting
-    request_delay = 0.08  # 12.5 req/sec = 750/min (conservative)
+    # Binance rate limits: 1200 requests per minute (20 req/sec)
+    # Use conservative 15 req/sec to avoid hitting limits
+    request_delay = 1.0 / 15.0  # ~0.067 seconds between requests
     last_request_time = [0.0]
+    rate_limit_errors = [0]
     
     def fetch_one(symbol: str):
+        # Rate limiting
         elapsed = time.time() - last_request_time[0]
         if elapsed < request_delay:
             time.sleep(request_delay - elapsed)
         last_request_time[0] = time.time()
-        return symbol, _depth_snapshot(client, symbol, use_cache=True)
+        
+        try:
+            return symbol, _depth_snapshot(client, symbol, use_cache=True)
+        except Exception as e:
+            error_str = str(e).lower()
+            if "429" in error_str or "rate limit" in error_str or "too many" in error_str:
+                rate_limit_errors[0] += 1
+                # Exponential backoff on rate limit
+                time.sleep(min(2.0 ** rate_limit_errors[0], 10.0))
+            raise
     
-    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+    # Process REST requests with controlled concurrency
+    with ThreadPoolExecutor(max_workers=min(max_workers, 4)) as executor:  # Limit workers to avoid rate limits
         future_to_symbol = {executor.submit(fetch_one, sym): sym for sym in rest_needed}
         for future in as_completed(future_to_symbol):
             try:
                 symbol, depth = future.result()
                 results[symbol] = depth
             except Exception as e:
-                logger.debug(f"Failed to fetch depth for {symbol}: {e}")
+                logger.debug(f"Failed to fetch depth for {future_to_symbol[future]}: {e}")
+    
+    if rate_limit_errors[0] > 0:
+        logger.warning(f"Encountered {rate_limit_errors[0]} rate limit errors during REST fetch")
     
     return results
 
@@ -990,35 +1176,38 @@ def find_candidate_routes(
         logger.info(f"Selected triangles: {direct_count} direct, {major_quote_count} via majors, {major_to_major_count} major-to-major")
         logger.info(f"Symbol optimization: {len(required_symbols)} symbols needed (limit: {max_symbols_to_fetch})")
 
-        # Start WebSocket streams for real-time data (10x faster)
+        # Start/update WebSocket connection (persistent, only updates subscriptions if needed)
         use_ws = getattr(S, "USE_BOOK_TICKER_WS", True) and SpotWebsocketClient is not None
         if use_ws and required_symbols:
             try:
-                # Restart stream with new symbols if needed
-                if _book_ticker_stream.running:
-                    _book_ticker_stream.stop()
-                    time.sleep(0.5)  # Brief pause for cleanup
-                
                 stream_url = getattr(S, "BINANCE_WS_URL", None)
                 kwargs = {"stream_url": stream_url} if stream_url else {}
-                _book_ticker_stream.start(required_symbols, **kwargs)
-                logger.info(f"Started real-time WebSocket feeds for {len(required_symbols)} symbols")
                 
-                # Allow time for initial data
-                time.sleep(2.0)
+                # Start or update WebSocket (keeps connection alive, only updates if symbols changed)
+                _book_ticker_stream.start(required_symbols, **kwargs)
+                
+                # Wait for initial data to populate (shorter wait since connection may already exist)
+                wait_time = 1.0 if _book_ticker_stream.running else 2.0
+                time.sleep(wait_time)
+                
+                # Check WebSocket coverage
+                ws_valid, ws_total = _book_ticker_stream.get_coverage(required_symbols)
+                logger.info(f"WebSocket: {ws_valid}/{ws_total} symbols have fresh data ({ws_valid/ws_total*100:.1f}% coverage)")
+                
             except Exception as e:
                 logger.warning(f"WebSocket startup failed, using REST only: {e}")
                 use_ws = False
         elif getattr(S, "USE_BOOK_TICKER_WS", True) and SpotWebsocketClient is None:
             logger.warning("WebSocket client not available, install binance-connector-python[websocket]")
         
-        # Fetch market data with WebSocket priority
+        # Fetch market data with WebSocket priority (minimal REST calls)
         start_fetch = time.time()
         depth_cache = _fetch_depth_parallel(client, required_symbols, max_workers=8)
         fetch_time = time.time() - start_fetch
         
         fetched_count = sum(1 for v in depth_cache.values() if v is not None)
-        ws_hits = sum(1 for sym in required_symbols if _book_ticker_stream.get(sym) is not None)
+        ws_valid, ws_total = _book_ticker_stream.get_coverage(required_symbols)
+        ws_hits = ws_valid
         
         stats["symbols_fetched"] = fetched_count
         stats["fetch_time"] = fetch_time
