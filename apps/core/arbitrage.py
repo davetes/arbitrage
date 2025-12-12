@@ -129,6 +129,38 @@ class CandidateRoute:
 
 
 @dataclass
+class PerformanceMetrics:
+    """Track arbitrage scanner performance"""
+    scan_count: int = 0
+    routes_found: int = 0
+    avg_profit: float = 0.0
+    max_profit: float = 0.0
+    success_rate: float = 0.0
+    ws_coverage: float = 0.0
+    scan_time_ms: float = 0.0
+    symbols_loaded: int = 0
+    triangles_checked: int = 0
+    
+    def update(self, routes: List[CandidateRoute], scan_time: float, ws_hits: int, total_symbols: int, triangles: int):
+        self.scan_count += 1
+        self.routes_found += len(routes)
+        self.scan_time_ms = scan_time * 1000
+        self.ws_coverage = (ws_hits / total_symbols * 100) if total_symbols > 0 else 0
+        self.triangles_checked = triangles
+        
+        if routes:
+            profits = [r.profit_pct for r in routes]
+            self.avg_profit = sum(profits) / len(profits)
+            self.max_profit = max(profits)
+        
+        self.success_rate = (self.routes_found / self.scan_count) if self.scan_count > 0 else 0
+
+
+# Global performance tracker
+_performance = PerformanceMetrics()
+
+
+@dataclass
 class TriangularArbResult:
     forward_profit_pct: float
     backward_profit_pct: float
@@ -156,15 +188,22 @@ def _client(timeout: int = None) -> BinanceClient:
 
 
 def _load_symbols(client: BinanceClient) -> Dict[str, dict]:
-    """Load symbols using FastSymbolLoader (cached, optionally full universe)"""
-    loader = get_symbol_loader(cache_ttl_seconds=300)
-    include_all_pairs = getattr(S, "LOAD_ALL_SYMBOLS", True)
-    return loader.load_symbols(
-        client,
-        base_asset=S.BASE_ASSET,
-        use_cache=True,
-        include_all_pairs=include_all_pairs,
-    )
+    """Load ALL symbols from Binance exchange info (full market coverage)"""
+    try:
+        # Force full symbol loading without filtering
+        exchange_info = client.exchange_info()
+        symbols = {}
+        for symbol_info in exchange_info.get("symbols", []):
+            symbol = symbol_info.get("symbol")
+            if symbol and symbol_info.get("status") == "TRADING":
+                symbols[symbol] = symbol_info
+        logger.info(f"Loaded {len(symbols)} trading symbols from exchange")
+        return symbols
+    except Exception as e:
+        logger.error(f"Failed to load symbols: {e}")
+        # Fallback to loader
+        loader = get_symbol_loader(cache_ttl_seconds=300)
+        return loader.load_symbols(client, base_asset=S.BASE_ASSET, use_cache=True, include_all_pairs=True)
 
 
 def _top_assets_by_quote_volume(
@@ -205,21 +244,23 @@ def _top_assets_by_quote_volume(
         return []
 
 
-def _top_assets_multi_quote(
+def _select_liquid_assets(
     client: BinanceClient,
     symbols: Dict[str, dict],
     quotes: List[str],
-    max_assets: int = 120,
-) -> List[str]:
-    """Rank assets by max 24h quoteVolume across multiple quote currencies."""
+    target_assets: int = 80,
+) -> Tuple[List[str], Dict[str, float]]:
+    """Smart selection of most liquid assets from top 200 by volume"""
     try:
         stats = client.ticker_24hr()
     except Exception:
-        return []
+        return [], {}
 
     quotes_upper = {q.upper() for q in quotes}
     vol_by_asset: Dict[str, float] = {}
+    count_by_asset: Dict[str, int] = {}
 
+    # Calculate volume and quote count for each asset
     for s in stats:
         sym = s.get("symbol")
         if not sym or sym not in symbols:
@@ -235,13 +276,30 @@ def _top_assets_multi_quote(
             continue
         try:
             vol = float(s.get("quoteVolume", 0))
+            vol_by_asset[base_asset] = max(vol_by_asset.get(base_asset, 0.0), vol)
+            count_by_asset[base_asset] = count_by_asset.get(base_asset, 0) + 1
         except Exception:
             continue
-        # Keep max volume seen across quotes
-        vol_by_asset[base_asset] = max(vol_by_asset.get(base_asset, 0.0), vol)
 
-    top = sorted(vol_by_asset.items(), key=lambda x: x[1], reverse=True)[:max_assets]
-    return [a for a, _ in top]
+    # Priority assets (always include)
+    priority = {"BTC", "ETH", "BNB", "SOL", "ADA", "DOT", "LINK", "MATIC", "ONT", "SSV", "KITE"}
+    
+    # Get top 200 by volume, then select 80 most liquid
+    top_200 = sorted(vol_by_asset.items(), key=lambda x: x[1], reverse=True)[:200]
+    
+    # Score by volume + multi-quote bonus
+    scored = []
+    for asset, vol in top_200:
+        score = vol + (count_by_asset.get(asset, 0) * 1000000)  # Bonus for multi-quote
+        if asset in priority:
+            score *= 2  # Double score for priority assets
+        scored.append((score, asset, vol))
+    
+    scored.sort(reverse=True)
+    selected = [asset for _, asset, _ in scored[:target_assets]]
+    volumes = {asset: vol for _, asset, vol in scored[:target_assets]}
+    
+    return selected, volumes
 
 
 def _depth_snapshot(client: BinanceClient, symbol: str, depth: int = 20, use_cache: bool = True) -> Optional[dict]:
@@ -294,17 +352,32 @@ def _depth_snapshot(client: BinanceClient, symbol: str, depth: int = 20, use_cac
     return None
 
 
-def _fetch_depth_parallel(client: BinanceClient, symbols: List[str], max_workers: int = 10) -> Dict[str, Optional[dict]]:
-    """Fetch multiple depth snapshots in parallel with rate limiting"""
+def _fetch_depth_parallel(client: BinanceClient, symbols: List[str], max_workers: int = 8) -> Dict[str, Optional[dict]]:
+    """Fetch depths in parallel with WebSocket priority and rate limiting"""
     results = {}
     
-    # Rate limiting: Binance allows ~1200 requests per minute
-    # We'll be conservative: max 10 requests per second = 600/min
-    request_delay = 0.1  # 100ms between requests = 10 req/sec
-    last_request_time = [0.0]  # Use list to allow modification in nested function
+    # First try WebSocket cache for all symbols
+    ws_hits = 0
+    rest_needed = []
+    for symbol in symbols:
+        ws_data = _book_ticker_stream.get(symbol)
+        if ws_data:
+            results[symbol] = ws_data
+            ws_hits += 1
+        else:
+            rest_needed.append(symbol)
+    
+    if ws_hits > 0:
+        logger.info(f"WebSocket cache hits: {ws_hits}/{len(symbols)} ({(ws_hits/len(symbols)*100):.1f}%)")
+    
+    if not rest_needed:
+        return results
+    
+    # Fetch remaining via REST with optimized rate limiting
+    request_delay = 0.08  # 12.5 req/sec = 750/min (conservative)
+    last_request_time = [0.0]
     
     def fetch_one(symbol: str):
-        # Rate limiting: ensure minimum delay between requests
         elapsed = time.time() - last_request_time[0]
         if elapsed < request_delay:
             time.sleep(request_delay - elapsed)
@@ -312,7 +385,7 @@ def _fetch_depth_parallel(client: BinanceClient, symbols: List[str], max_workers
         return symbol, _depth_snapshot(client, symbol, use_cache=True)
     
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        future_to_symbol = {executor.submit(fetch_one, sym): sym for sym in symbols}
+        future_to_symbol = {executor.submit(fetch_one, sym): sym for sym in rest_needed}
         for future in as_completed(future_to_symbol):
             try:
                 symbol, depth = future.result()
@@ -708,44 +781,26 @@ def find_candidate_routes(
         asset_quote_map = {}  # Track which quotes each asset trades with
         asset_volumes = {}    # Track 24h volumes
         
-        # Get volume data for scoring
-        try:
-            ticker_stats = client.ticker_24hr()
-            volume_by_asset = {}
-            for stat in ticker_stats:
-                symbol_name = stat.get("symbol")
-                if symbol_name in symbols:
-                    info = symbols[symbol_name]
-                    base_asset = info.get("baseAsset")
-                    quote_asset = info.get("quoteAsset")
-                    if quote_asset in MAJOR_QUOTES and base_asset != base:
-                        try:
-                            volume = float(stat.get("quoteVolume", 0))
-                            volume_by_asset[base_asset] = max(volume_by_asset.get(base_asset, 0), volume)
-                        except Exception:
-                            pass
-            asset_volumes = volume_by_asset
-        except Exception:
-            logger.warning("Failed to fetch volume data for scoring")
+        # Smart asset selection from top 200 by volume
+        universe, asset_volumes = _select_liquid_assets(client, symbols, MAJOR_QUOTES, max_assets)
+        logger.info(f"Selected {len(universe)} liquid assets from top 200 by volume")
         
+        _performance.symbols_loaded = len(symbols)
+        
+        # Build asset quote map for selected universe
+        asset_quote_map = {}
         for symbol_name, symbol_info in symbols.items():
             if symbol_info.get("status") != "TRADING":
                 continue
             quote_asset = symbol_info.get("quoteAsset")
             base_asset = symbol_info.get("baseAsset")
             
-            if quote_asset in MAJOR_QUOTES and base_asset != base:
-                universe.add(base_asset)
+            if quote_asset in MAJOR_QUOTES and base_asset in universe:
                 if base_asset not in asset_quote_map:
                     asset_quote_map[base_asset] = set()
                 asset_quote_map[base_asset].add(quote_asset)
         
-        # Prioritize assets by volume and multi-quote trading
-        universe_list = sorted(universe, 
-                             key=lambda x: (len(asset_quote_map.get(x, set())), asset_volumes.get(x, 0)), 
-                             reverse=True)
-        universe = universe_list[:max_assets]
-        logger.info(f"Using {len(universe)} top assets: {universe[:10]}{'...' if len(universe) > 10 else ''}")
+        logger.info(f"Using {len(universe)} liquid assets: {universe[:10]}{'...' if len(universe) > 10 else ''}")
         
         # Generate and score all triangles
         all_triangles = []
@@ -828,58 +883,86 @@ def find_candidate_routes(
         logger.info(f"Selected triangles: {direct_count} direct, {major_quote_count} via majors, {major_to_major_count} major-to-major")
         logger.info(f"Symbol optimization: {len(required_symbols)} symbols needed (limit: {max_symbols_to_fetch})")
 
-        # Optional: start websocket bookTicker stream
+        # Start WebSocket streams for real-time data (10x faster)
         use_ws = getattr(S, "USE_BOOK_TICKER_WS", True) and SpotWebsocketClient is not None
         if use_ws and required_symbols:
             try:
+                # Restart stream with new symbols if needed
+                if _book_ticker_stream.running:
+                    _book_ticker_stream.stop()
+                    time.sleep(0.5)  # Brief pause for cleanup
+                
                 stream_url = getattr(S, "BINANCE_WS_URL", None)
                 kwargs = {"stream_url": stream_url} if stream_url else {}
                 _book_ticker_stream.start(required_symbols, **kwargs)
-                logger.info(f"Started bookTicker websocket for {len(required_symbols)} symbols")
+                logger.info(f"Started real-time WebSocket feeds for {len(required_symbols)} symbols")
+                
+                # Allow time for initial data
+                time.sleep(2.0)
             except Exception as e:
-                logger.warning(f"Failed to start bookTicker websocket, falling back to REST: {e}")
+                logger.warning(f"WebSocket startup failed, using REST only: {e}")
                 use_ws = False
         elif getattr(S, "USE_BOOK_TICKER_WS", True) and SpotWebsocketClient is None:
-            logger.warning("USE_BOOK_TICKER_WS is True but SpotWebsocketClient is not installed; using REST depth only.")
+            logger.warning("WebSocket client not available, install binance-connector-python[websocket]")
         
-        # Fetch depths for optimized symbol set
+        # Fetch market data with WebSocket priority
         start_fetch = time.time()
-        depth_cache = _fetch_depth_parallel(client, required_symbols, max_workers=5)
+        depth_cache = _fetch_depth_parallel(client, required_symbols, max_workers=8)
         fetch_time = time.time() - start_fetch
+        
         fetched_count = sum(1 for v in depth_cache.values() if v is not None)
+        ws_hits = sum(1 for sym in required_symbols if _book_ticker_stream.get(sym) is not None)
+        
         stats["symbols_fetched"] = fetched_count
         stats["fetch_time"] = fetch_time
+        stats["ws_hits"] = ws_hits
         
         coverage_pct = (fetched_count / len(required_symbols)) * 100 if required_symbols else 0
-        logger.info(f"Fetched {fetched_count}/{len(required_symbols)} depths ({coverage_pct:.1f}% coverage) in {fetch_time:.2f}s")
+        ws_pct = (ws_hits / len(required_symbols)) * 100 if required_symbols else 0
+        logger.info(f"Market data: {fetched_count}/{len(required_symbols)} symbols ({coverage_pct:.1f}% coverage, {ws_pct:.1f}% WebSocket) in {fetch_time:.2f}s")
         
-        # Check selected triangles with complete data coverage
+        # Concurrent triangle scanning for faster detection
         cand: List[CandidateRoute] = []
-        checked = 0
         start_triangles = time.time()
         route_keys = set()
         
-        for x, y in selected_triangles:
-            checked += 1
-            
-            # Try the triangle
-            r = _try_triangle(
+        def check_triangle(triangle_pair):
+            x, y = triangle_pair
+            return _try_triangle(
                 client, symbols, base, x, y,
                 min_profit_pct, max_profit_pct,
                 depth_cache=depth_cache,
                 available_balance=available_balance,
                 stats=stats
             )
+        
+        # Process triangles in parallel batches
+        batch_size = 32
+        checked = 0
+        
+        with ThreadPoolExecutor(max_workers=4) as executor:
+            for i in range(0, len(selected_triangles), batch_size):
+                batch = selected_triangles[i:i + batch_size]
+                futures = {executor.submit(check_triangle, triangle): triangle for triangle in batch}
                 
-            if r:
-                route_key = (r.a, r.b, r.c)
-                if route_key not in route_keys:
-                    route_keys.add(route_key)
-                    logger.debug(f"Found route: {r.a} → {r.b} → {r.c}, profit: {r.profit_pct}%, volume: ${r.volume_usd}")
-                    cand.append(r)
-                    stats["routes_found"] += 1
-                    if len(cand) >= 5:
-                        break
+                for future in as_completed(futures):
+                    checked += 1
+                    try:
+                        r = future.result()
+                        if r:
+                            route_key = (r.a, r.b, r.c)
+                            if route_key not in route_keys:
+                                route_keys.add(route_key)
+                                logger.info(f"PROFITABLE: {r.a} → {r.b} → {r.c}, profit: {r.profit_pct}%, volume: ${r.volume_usd}")
+                                cand.append(r)
+                                stats["routes_found"] += 1
+                                if len(cand) >= 5:
+                                    break
+                    except Exception as e:
+                        logger.debug(f"Triangle check failed: {e}")
+                
+                if len(cand) >= 5:
+                    break
         
         triangle_time = time.time() - start_triangles
         stats["triangles_checked"] = checked
@@ -889,16 +972,24 @@ def find_candidate_routes(
         logger.info(f"Found {len(cand)} routes")
         logger.info(f"Filter stats: missing_pairs={stats['filtered_missing_pairs']}, profit={stats['filtered_profit']}, volume={stats['filtered_volume']}")
         
-        # Enhanced efficiency metrics
+        # Performance metrics and efficiency tracking
+        total_scan_time = time.time() - start_fetch
+        _performance.update(cand, total_scan_time, ws_hits, len(required_symbols), checked)
+        
         if checked > 0:
             missing_pct = (stats['filtered_missing_pairs'] / checked) * 100.0
             profit_pct = (stats['filtered_profit'] / checked) * 100.0
             logger.info(f"Efficiency: {missing_pct:.1f}% missing pairs, {profit_pct:.1f}% filtered by profit")
             
-            # Optimization metrics
+            # Performance metrics
             selection_ratio = (stats['triangles_selected'] / stats['triangles_generated']) * 100 if stats['triangles_generated'] > 0 else 0
             symbol_efficiency = checked / len(required_symbols) if required_symbols else 0
+            
+            logger.info(f"Performance: {_performance.scan_time_ms:.0f}ms scan, {_performance.success_rate:.1f}% success rate, {_performance.ws_coverage:.1f}% WebSocket")
             logger.info(f"Optimization: {selection_ratio:.1f}% triangles selected, {symbol_efficiency:.2f} triangles per symbol")
+            
+            if _performance.routes_found > 0:
+                logger.info(f"P&L Metrics: {_performance.avg_profit:.4f}% avg profit, {_performance.max_profit:.4f}% max profit")
         
         if stats.get("sample_profits"):
             profits = stats["sample_profits"]
@@ -920,6 +1011,19 @@ def find_candidate_routes(
         
         # Sort by profit desc and return top 5
         cand.sort(key=lambda z: z.profit_pct, reverse=True)
+        
+        # Enhanced stats with performance data
+        stats.update({
+            "performance": {
+                "scan_count": _performance.scan_count,
+                "success_rate": _performance.success_rate,
+                "avg_profit": _performance.avg_profit,
+                "max_profit": _performance.max_profit,
+                "ws_coverage": _performance.ws_coverage,
+                "scan_time_ms": _performance.scan_time_ms,
+            }
+        })
+        
         return cand[:5], stats
         
     except Exception as e:
@@ -955,6 +1059,27 @@ def revalidate_route(route: CandidateRoute) -> Optional[CandidateRoute]:
     except Exception as e:
         logger.error(f"Error revalidating route: {e}")
         return None
+
+
+def get_performance_metrics() -> dict:
+    """Get current performance metrics for monitoring"""
+    return {
+        "scan_count": _performance.scan_count,
+        "routes_found": _performance.routes_found,
+        "success_rate": round(_performance.success_rate, 2),
+        "avg_profit": round(_performance.avg_profit, 4),
+        "max_profit": round(_performance.max_profit, 4),
+        "ws_coverage": round(_performance.ws_coverage, 1),
+        "scan_time_ms": round(_performance.scan_time_ms, 0),
+        "symbols_loaded": _performance.symbols_loaded,
+        "triangles_checked": _performance.triangles_checked,
+    }
+
+
+def reset_performance_metrics():
+    """Reset performance tracking"""
+    global _performance
+    _performance = PerformanceMetrics()
 
 
 # Optional: Debug function to test specific triangles
