@@ -244,23 +244,36 @@ def _top_assets_by_quote_volume(
         return []
 
 
-def _select_liquid_assets(
+def _select_all_assets(
     client: BinanceClient,
     symbols: Dict[str, dict],
     quotes: List[str],
-    target_assets: int = 80,
 ) -> Tuple[List[str], Dict[str, float]]:
-    """Smart selection of most liquid assets from top 200 by volume"""
+    """Load ALL assets that trade with major quotes (2000+ symbols)"""
     try:
         stats = client.ticker_24hr()
     except Exception:
-        return [], {}
+        # Fallback: extract from symbols dict
+        quotes_upper = {q.upper() for q in quotes}
+        assets = set()
+        volumes = {}
+        for sym, info in symbols.items():
+            if info.get("status") != "TRADING":
+                continue
+            quote = info.get("quoteAsset", "").upper()
+            if quote not in quotes_upper:
+                continue
+            base_asset = info.get("baseAsset", "").upper()
+            if base_asset and base_asset != quote:
+                assets.add(base_asset)
+                volumes[base_asset] = volumes.get(base_asset, 0.0)
+        return list(assets), volumes
 
     quotes_upper = {q.upper() for q in quotes}
     vol_by_asset: Dict[str, float] = {}
-    count_by_asset: Dict[str, int] = {}
+    assets_set = set()
 
-    # Calculate volume and quote count for each asset
+    # Extract ALL assets that trade with major quotes
     for s in stats:
         sym = s.get("symbol")
         if not sym or sym not in symbols:
@@ -274,32 +287,15 @@ def _select_liquid_assets(
         base_asset = info.get("baseAsset", "").upper()
         if not base_asset or base_asset == quote:
             continue
+        assets_set.add(base_asset)
         try:
             vol = float(s.get("quoteVolume", 0))
             vol_by_asset[base_asset] = max(vol_by_asset.get(base_asset, 0.0), vol)
-            count_by_asset[base_asset] = count_by_asset.get(base_asset, 0) + 1
         except Exception:
             continue
 
-    # Priority assets (always include)
-    priority = {"BTC", "ETH", "BNB", "SOL", "ADA", "DOT", "LINK", "MATIC", "ONT", "SSV", "KITE"}
-    
-    # Get top 200 by volume, then select 80 most liquid
-    top_200 = sorted(vol_by_asset.items(), key=lambda x: x[1], reverse=True)[:200]
-    
-    # Score by volume + multi-quote bonus
-    scored = []
-    for asset, vol in top_200:
-        score = vol + (count_by_asset.get(asset, 0) * 1000000)  # Bonus for multi-quote
-        if asset in priority:
-            score *= 2  # Double score for priority assets
-        scored.append((score, asset, vol))
-    
-    scored.sort(reverse=True)
-    selected = [asset for _, asset, _ in scored[:target_assets]]
-    volumes = {asset: vol for _, asset, vol in scored[:target_assets]}
-    
-    return selected, volumes
+    # Return all assets (2000+)
+    return list(assets_set), vol_by_asset
 
 
 def _depth_snapshot(client: BinanceClient, symbol: str, depth: int = 20, use_cache: bool = True) -> Optional[dict]:
@@ -406,21 +402,27 @@ def _try_triangle(
     max_profit_pct: float = None,
     depth_cache: Dict[str, Optional[dict]] = None,
     available_balance: float = None,
-    stats: dict = None
+    stats: dict = None,
+    require_intermediate: bool = True
 ) -> Optional[CandidateRoute]:
     """
     Triangle detection for Binance's actual pair formats.
     Route: base -> x -> y -> base
     Format required: XBASE (e.g., BTCUSDT), YX (e.g., ETHBTC), YBASE (e.g., ETHUSDT)
+    
+    If require_intermediate=False, allows routes without cross pair (direct only for non-major assets).
     """
     def get_depth(symbol: str) -> Optional[dict]:
         if depth_cache is not None:
             return depth_cache.get(symbol)
         return _depth_snapshot(client, symbol, use_cache=True)
     
+    # Major assets that require intermediate pairs
+    MAJOR_ASSETS = {"BTC", "ETH", "BNB", "USDT", "USDC", "FDUSD"}
+    
     # We need these 3 symbols:
     # 1. X/base (e.g., BTCUSDT) - buy X with base
-    # 2. Y/X (e.g., ETHBTC) - buy Y with X (or inverse if only XY exists)
+    # 2. Y/X (e.g., ETHBTC) - buy Y with X (or inverse if only XY exists) - OPTIONAL for non-major
     # 3. Y/base (e.g., ETHUSDT) - sell Y for base
     
     symbol1 = f"{x}{base}"  # Xbase (e.g., BTCUSDT)
@@ -428,42 +430,99 @@ def _try_triangle(
     symbol2_alt = f"{x}{y}" # XY fallback (e.g., BTCETH)
     symbol3 = f"{y}{base}"  # Ybase (e.g., ETHUSDT)
     
-    # Check all symbols exist
+    # Check base pairs exist
     if symbol1 not in symbols or symbol3 not in symbols:
         return None
     
-    # Get depths
+    # Get depths for base pairs
     d1 = get_depth(symbol1)
+    d3 = get_depth(symbol3)
+    
+    if not d1 or not d3:
+        return None
+    
+    # For non-major assets, intermediate pair is optional
+    # If both x and y are non-major, we can skip intermediate pair check
+    is_major_x = x in MAJOR_ASSETS
+    is_major_y = y in MAJOR_ASSETS
+    
+    # Only require intermediate pair if:
+    # 1. require_intermediate is True (explicit requirement)
+    # 2. At least one asset is major (for quality routes)
+    need_intermediate = require_intermediate or is_major_x or is_major_y
+    
     d2 = None
     inverted_cross = False
-    if symbol2 in symbols:
-        d2 = get_depth(symbol2)
-    elif symbol2_alt in symbols:
-        # Use inverted depth from XY
-        orig = get_depth(symbol2_alt)
-        if orig:
-            # Invert bids/asks: price flips, bids become asks
-            try:
-                inv_ask = 1.0 / orig["bid_price"] if orig["bid_price"] else None
-                inv_bid = 1.0 / orig["ask_price"] if orig["ask_price"] else None
-            except Exception:
-                inv_ask = inv_bid = None
-            if inv_ask and inv_bid:
+    
+    if need_intermediate:
+        # Try to get intermediate pair
+        if symbol2 in symbols:
+            d2 = get_depth(symbol2)
+        elif symbol2_alt in symbols:
+            # Use inverted depth from XY
+            orig = get_depth(symbol2_alt)
+            if orig:
+                # Invert bids/asks: price flips, bids become asks
+                try:
+                    inv_ask = 1.0 / orig["bid_price"] if orig["bid_price"] else None
+                    inv_bid = 1.0 / orig["ask_price"] if orig["ask_price"] else None
+                except Exception:
+                    inv_ask = inv_bid = None
+                if inv_ask and inv_bid:
+                    d2 = {
+                        "ask_price": inv_ask,
+                        "bid_price": inv_bid,
+                        "ask_qty": orig.get("bid_qty", 0),
+                        "bid_qty": orig.get("ask_qty", 0),
+                        "total_ask_qty": orig.get("total_bid_qty", 0),
+                        "total_bid_qty": orig.get("total_ask_qty", 0),
+                        "cap_ask_quote": 0,
+                        "cap_bid_quote": 0,
+                    }
+                    inverted_cross = True
+        
+        # If intermediate required but not found, skip
+        if not d2:
+            if stats is not None:
+                stats["filtered_missing_pairs"] = stats.get("filtered_missing_pairs", 0) + 1
+            return None
+    else:
+        # For non-major assets without intermediate pair, use synthetic cross rate
+        # Calculate cross rate from base pairs: Y/X = (Y/base) / (X/base)
+        try:
+            x_base_ask = d1["ask_price"]  # Price to buy X with base
+            x_base_bid = d1["bid_price"]   # Price to sell X for base
+            y_base_ask = d3["ask_price"]  # Price to buy Y with base
+            y_base_bid = d3["bid_price"]   # Price to sell Y for base
+            
+            # Synthetic Y/X calculation:
+            # To buy Y with X: sell X for base (X/base bid), then buy Y with base (Y/base ask)
+            # Y/X ask = (Y/base ask) / (X/base bid)
+            # To sell Y for X: sell Y for base (Y/base bid), then buy X with base (X/base ask)
+            # Y/X bid = (Y/base bid) / (X/base ask)
+            synthetic_ask = y_base_ask / x_base_bid if x_base_bid > 0 else None
+            synthetic_bid = y_base_bid / x_base_ask if x_base_ask > 0 else None
+            
+            # Validate synthetic prices are reasonable
+            if (synthetic_ask and synthetic_bid and 
+                synthetic_ask > 0 and synthetic_bid > 0 and
+                synthetic_ask >= synthetic_bid):  # Ask should be >= bid
                 d2 = {
-                    "ask_price": inv_ask,
-                    "bid_price": inv_bid,
-                    # quantities not used in theoretical mode; keep placeholders
-                    "ask_qty": orig.get("bid_qty", 0),
-                    "bid_qty": orig.get("ask_qty", 0),
-                    "total_ask_qty": orig.get("total_bid_qty", 0),
-                    "total_bid_qty": orig.get("total_ask_qty", 0),
+                    "ask_price": synthetic_ask,
+                    "bid_price": synthetic_bid,
+                    "ask_qty": min(d1["bid_qty"], d3["ask_qty"]),
+                    "bid_qty": min(d1["ask_qty"], d3["bid_qty"]),
+                    "total_ask_qty": min(d1["total_bid_qty"], d3["total_ask_qty"]),
+                    "total_bid_qty": min(d1["total_ask_qty"], d3["total_bid_qty"]),
                     "cap_ask_quote": 0,
                     "cap_bid_quote": 0,
                 }
-                inverted_cross = True
-    d3 = get_depth(symbol3)
+            else:
+                return None
+        except Exception:
+            return None
     
-    if not all([d1, d2, d3]):
+    if not d2:
         return None
     
     # Pattern evaluation: Only valid patterns starting with BUY (we start with base asset)
@@ -700,8 +759,8 @@ def _get_triangle_symbols(x: str, y: str, base: str) -> List[str]:
 
 def _optimize_symbol_selection(scored_triangles: List[Tuple[float, str, str]], 
                               base: str, symbols: Dict[str, dict], 
-                              max_symbols: int = 200) -> Tuple[List[Tuple[str, str]], List[str]]:
-    """Select triangles to maximize coverage within symbol limit"""
+                              max_symbols: int = 500) -> Tuple[List[Tuple[str, str]], List[str]]:
+    """Select triangles to maximize coverage within symbol limit - optimized for 2000+ symbols"""
     selected_triangles = []
     required_symbols = set()
     
@@ -712,6 +771,9 @@ def _optimize_symbol_selection(scored_triangles: List[Tuple[float, str, str]],
             major_pair = f"{major}{base}"
             if major_pair in symbols:
                 required_symbols.add(major_pair)
+    
+    # Track symbol usage count for better optimization
+    symbol_usage = {}
     
     # Add triangles in score order until symbol limit
     for score, x, y in scored_triangles:
@@ -725,9 +787,15 @@ def _optimize_symbol_selection(scored_triangles: List[Tuple[float, str, str]],
             selected_triangles.append((x, y))
             required_symbols.update(new_symbols)
             
-            # Early exit if we have enough triangles
-            if len(selected_triangles) >= 400:
+            # Track symbol usage
+            for sym in valid_symbols:
+                symbol_usage[sym] = symbol_usage.get(sym, 0) + 1
+            
+            # Early exit if we have enough triangles (increased limit for larger sets)
+            if len(selected_triangles) >= 2000:
                 break
+    
+    logger.debug(f"Symbol optimization: {len(required_symbols)} symbols for {len(selected_triangles)} triangles")
     
     return selected_triangles, list(required_symbols)
 
@@ -767,27 +835,22 @@ def find_candidate_routes(
         allowed_quotes = getattr(S, "ALLOWED_QUOTES", ["USDT", "BTC", "ETH", "BNB", "FDUSD", "USDC"])
         if base not in allowed_quotes:
             allowed_quotes.append(base)
-        max_assets = getattr(S, "MAX_ASSETS", 80)  # Optimized for quality
         logger.info(
             f"Loaded {len(symbols)} symbols, base={base}, profit range: {min_profit_pct}% - {max_profit_pct}%, "
-            f"quotes={allowed_quotes}, max_assets={max_assets}"
+            f"quotes={allowed_quotes}"
         )
         
         # Define major quotes for routing
         MAJOR_QUOTES = ["USDT", "BTC", "ETH", "BNB", "USDC", "FDUSD"]
+        MAJOR_ASSETS = {"BTC", "ETH", "BNB", "USDT", "USDC", "FDUSD"}
         
-        # Build asset universe with volume data
-        universe = set()
-        asset_quote_map = {}  # Track which quotes each asset trades with
-        asset_volumes = {}    # Track 24h volumes
-        
-        # Smart asset selection from top 200 by volume
-        universe, asset_volumes = _select_liquid_assets(client, symbols, MAJOR_QUOTES, max_assets)
-        logger.info(f"Selected {len(universe)} liquid assets from top 200 by volume")
+        # Load ALL assets (2000+) that trade with major quotes
+        universe, asset_volumes = _select_all_assets(client, symbols, MAJOR_QUOTES)
+        logger.info(f"Loaded {len(universe)} assets from all trading pairs (2000+ symbols)")
         
         _performance.symbols_loaded = len(symbols)
         
-        # Build asset quote map for selected universe
+        # Build asset quote map for all assets
         asset_quote_map = {}
         for symbol_name, symbol_info in symbols.items():
             if symbol_info.get("status") != "TRADING":
@@ -800,86 +863,130 @@ def find_candidate_routes(
                     asset_quote_map[base_asset] = set()
                 asset_quote_map[base_asset].add(quote_asset)
         
-        logger.info(f"Using {len(universe)} liquid assets: {universe[:10]}{'...' if len(universe) > 10 else ''}")
+        logger.info(f"Using {len(universe)} assets with {sum(len(v) for v in asset_quote_map.values())} quote pairs")
         
-        # Generate and score all triangles
+        # Generate and score all triangles efficiently
         all_triangles = []
+        triangle_set = set()  # Track unique triangles
         
-        # Pattern 1: Major-to-major (highest priority)
-        major_assets = ["BTC", "ETH", "BNB"]
-        for i, major1 in enumerate(major_assets):
+        # Pattern 1: Major-to-major (highest priority) - require intermediate
+        major_assets_list = ["BTC", "ETH", "BNB"]
+        for i, major1 in enumerate(major_assets_list):
             if major1 == base:
                 continue
-            for major2 in major_assets[i+1:]:
+            for major2 in major_assets_list[i+1:]:
                 if major2 == base or major2 == major1:
                     continue
                 
-                # Check if cross pair exists
-                cross1 = f"{major2}{major1}"
-                cross2 = f"{major1}{major2}"
-                if ((cross1 in symbols and symbols[cross1].get("status") == "TRADING") or
-                    (cross2 in symbols and symbols[cross2].get("status") == "TRADING")):
-                    score = _score_triangle(major1, major2, base, asset_volumes, asset_quote_map)
-                    all_triangles.append((score, major1, major2))
+                # Check if both have base pairs
+                if (f"{major1}{base}" in symbols and f"{major2}{base}" in symbols):
+                    # Check if cross pair exists (preferred but not strictly required for scoring)
+                    cross1 = f"{major2}{major1}"
+                    cross2 = f"{major1}{major2}"
+                    has_cross = ((cross1 in symbols and symbols[cross1].get("status") == "TRADING") or
+                                 (cross2 in symbols and symbols[cross2].get("status") == "TRADING"))
+                    
+                    key = tuple(sorted([major1, major2]))
+                    if key not in triangle_set:
+                        triangle_set.add(key)
+                        score = _score_triangle(major1, major2, base, asset_volumes, asset_quote_map)
+                        if has_cross:
+                            score += 100.0  # Bonus for having cross pair
+                        all_triangles.append((score, major1, major2, True))  # True = require intermediate
         
-        # Pattern 2: Major routing and direct triangles
+        # Pattern 2: Major routing (require intermediate for major assets)
         for asset in universe:
+            if asset == base:
+                continue
             asset_quotes = asset_quote_map.get(asset, set())
             
+            if base not in asset_quotes:
+                continue
+            
             # Major routing triangles
-            for major in ["BTC", "ETH", "BNB"]:
+            for major in major_assets_list:
                 if major == base or major == asset:
                     continue
-                if major in asset_quotes and base in asset_quotes:
-                    score = _score_triangle(major, asset, base, asset_volumes, asset_quote_map)
-                    all_triangles.append((score, major, asset))
-            
-            # Direct asset triangles (lower priority)
-            if base in asset_quotes:
-                for other_asset in universe:
-                    if other_asset == asset:
-                        continue
-                    other_quotes = asset_quote_map.get(other_asset, set())
-                    if base in other_quotes:
-                        # Check if cross pair exists
-                        cross1 = f"{other_asset}{asset}"
-                        cross2 = f"{asset}{other_asset}"
-                        if ((cross1 in symbols and symbols[cross1].get("status") == "TRADING") or
-                            (cross2 in symbols and symbols[cross2].get("status") == "TRADING")):
-                            score = _score_triangle(asset, other_asset, base, asset_volumes, asset_quote_map)
-                            all_triangles.append((score, asset, other_asset))
+                if major in asset_quotes:
+                    key = tuple(sorted([major, asset]))
+                    if key not in triangle_set:
+                        triangle_set.add(key)
+                        score = _score_triangle(major, asset, base, asset_volumes, asset_quote_map)
+                        # Major assets require intermediate pair
+                        require_int = major in MAJOR_ASSETS or asset in MAJOR_ASSETS
+                        all_triangles.append((score, major, asset, require_int))
         
-        # Sort by score (highest first) and remove duplicates
+        # Pattern 3: Direct triangles (intermediate optional for non-major)
+        # Only check pairs that both trade with base
+        base_trading_assets = [a for a in universe if base in asset_quote_map.get(a, set())]
+        
+        # Optimize: check in batches, prioritize high-volume pairs
+        base_trading_assets.sort(key=lambda a: asset_volumes.get(a, 0.0), reverse=True)
+        
+        # Limit direct triangle checks to top pairs to avoid explosion
+        max_direct_checks = getattr(S, "MAX_DIRECT_TRIANGLES", 5000)
+        checked_pairs = 0
+        
+        for i, asset in enumerate(base_trading_assets):
+            if checked_pairs >= max_direct_checks:
+                break
+            for other_asset in base_trading_assets[i+1:]:
+                if checked_pairs >= max_direct_checks:
+                    break
+                checked_pairs += 1
+                
+                key = tuple(sorted([asset, other_asset]))
+                if key not in triangle_set:
+                    triangle_set.add(key)
+                    # For non-major assets, intermediate is optional
+                    require_int = asset in MAJOR_ASSETS or other_asset in MAJOR_ASSETS
+                    score = _score_triangle(asset, other_asset, base, asset_volumes, asset_quote_map)
+                    # Lower score for non-major pairs without intermediate
+                    if not require_int:
+                        score *= 0.5
+                    all_triangles.append((score, asset, other_asset, require_int))
+        
+        # Sort by score (highest first)
         all_triangles.sort(reverse=True)
-        seen = set()
-        unique_triangles = []
-        for score, x, y in all_triangles:
-            key = tuple(sorted([x, y]))
-            if key not in seen:
-                seen.add(key)
-                unique_triangles.append((score, x, y))
         
-        stats["triangles_generated"] = len(unique_triangles)
+        stats["triangles_generated"] = len(all_triangles)
         
         # Optimize symbol selection for rate limits
-        max_symbols_to_fetch = getattr(S, "MAX_DEPTH_FETCH", 200)
-        selected_triangles, required_symbols = _optimize_symbol_selection(
-            unique_triangles, base, symbols, max_symbols_to_fetch
+        # Increase limit for larger symbol sets
+        max_symbols_to_fetch = getattr(S, "MAX_DEPTH_FETCH", 500)  # Increased from 200
+        
+        # Extract triangles without require_intermediate flag for optimization function
+        triangles_for_opt = [(score, x, y) for score, x, y, _ in all_triangles]
+        selected_triangles_opt, required_symbols = _optimize_symbol_selection(
+            triangles_for_opt, base, symbols, max_symbols_to_fetch
         )
+        
+        # Rebuild selected triangles with require_intermediate flag
+        selected_triangles = []
+        selected_set = {(x, y) for x, y in selected_triangles_opt}
+        for score, x, y, require_int in all_triangles:
+            if (x, y) in selected_set:
+                selected_triangles.append((x, y, require_int))
+                if len(selected_triangles) >= len(selected_triangles_opt):
+                    break
         
         stats["triangles_selected"] = len(selected_triangles)
         
         # Analyze selected triangle types
         direct_count = major_quote_count = major_to_major_count = 0
-        for x, y in selected_triangles:
-            if x in major_assets and y in major_assets:
+        for triangle_data in selected_triangles:
+            if len(triangle_data) == 3:
+                x, y, _ = triangle_data
+            else:
+                x, y = triangle_data
+            if x in MAJOR_ASSETS and y in MAJOR_ASSETS:
                 major_to_major_count += 1
-            elif x in major_assets or y in major_assets:
+            elif x in MAJOR_ASSETS or y in MAJOR_ASSETS:
                 major_quote_count += 1
             else:
                 direct_count += 1
         
-        logger.info(f"Optimized selection: {len(selected_triangles)} triangles from {len(unique_triangles)} candidates")
+        logger.info(f"Optimized selection: {len(selected_triangles)} triangles from {len(all_triangles)} candidates")
         logger.info(f"Selected triangles: {direct_count} direct, {major_quote_count} via majors, {major_to_major_count} major-to-major")
         logger.info(f"Symbol optimization: {len(required_symbols)} symbols needed (limit: {max_symbols_to_fetch})")
 
@@ -926,21 +1033,27 @@ def find_candidate_routes(
         start_triangles = time.time()
         route_keys = set()
         
-        def check_triangle(triangle_pair):
-            x, y = triangle_pair
+        def check_triangle(triangle_data):
+            if len(triangle_data) == 3:
+                x, y, require_int = triangle_data
+            else:
+                x, y = triangle_data
+                require_int = True  # Default to requiring intermediate
             return _try_triangle(
                 client, symbols, base, x, y,
                 min_profit_pct, max_profit_pct,
                 depth_cache=depth_cache,
                 available_balance=available_balance,
-                stats=stats
+                stats=stats,
+                require_intermediate=require_int
             )
         
-        # Process triangles in parallel batches
-        batch_size = 32
+        # Process triangles in parallel batches with optimized filtering
+        batch_size = 64  # Increased batch size for efficiency
         checked = 0
+        max_routes = getattr(S, "MAX_ROUTES_TO_RETURN", 10)
         
-        with ThreadPoolExecutor(max_workers=4) as executor:
+        with ThreadPoolExecutor(max_workers=8) as executor:  # Increased workers
             for i in range(0, len(selected_triangles), batch_size):
                 batch = selected_triangles[i:i + batch_size]
                 futures = {executor.submit(check_triangle, triangle): triangle for triangle in batch}
@@ -956,12 +1069,12 @@ def find_candidate_routes(
                                 logger.info(f"PROFITABLE: {r.a} → {r.b} → {r.c}, profit: {r.profit_pct}%, volume: ${r.volume_usd}")
                                 cand.append(r)
                                 stats["routes_found"] += 1
-                                if len(cand) >= 5:
+                                if len(cand) >= max_routes:
                                     break
                     except Exception as e:
                         logger.debug(f"Triangle check failed: {e}")
                 
-                if len(cand) >= 5:
+                if len(cand) >= max_routes:
                     break
         
         triangle_time = time.time() - start_triangles
@@ -1009,8 +1122,20 @@ def find_candidate_routes(
             for cr in close_routes[:5]:  # Show first 5
                 logger.info(f"  {cr['route']}: {cr['gross']:.4f}% gross ({cr['net']:.4f}% net) pattern={cr['pattern']}")
         
-        # Sort by profit desc and return top 5
+        # Sort by profit desc and filter routes
         cand.sort(key=lambda z: z.profit_pct, reverse=True)
+        
+        # Filter routes: remove duplicates and low-quality routes
+        filtered_cand = []
+        seen_profit = set()
+        for route in cand:
+            # Round profit to avoid near-duplicates
+            profit_key = round(route.profit_pct, 2)
+            if profit_key not in seen_profit:
+                seen_profit.add(profit_key)
+                filtered_cand.append(route)
+        
+        max_return = getattr(S, "MAX_ROUTES_TO_RETURN", 10)
         
         # Enhanced stats with performance data
         stats.update({
@@ -1021,10 +1146,11 @@ def find_candidate_routes(
                 "max_profit": _performance.max_profit,
                 "ws_coverage": _performance.ws_coverage,
                 "scan_time_ms": _performance.scan_time_ms,
-            }
+            },
+            "routes_filtered": len(cand) - len(filtered_cand)
         })
         
-        return cand[:5], stats
+        return filtered_cand[:max_return], stats
         
     except Exception as e:
         logger.error(f"Error in find_candidate_routes: {e}", exc_info=True)
