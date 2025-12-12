@@ -342,6 +342,7 @@ def _load_symbols(client: BinanceClient) -> Dict[str, dict]:
                 "symbol": symbol,
                 "baseAsset": base_asset,
                 "quoteAsset": quote_asset,
+                
                 "status": "TRADING"
             }
         
@@ -1066,6 +1067,7 @@ def find_candidate_routes(
         
         def add_triangle(x: str, y: str, score: float, require_int: bool, pattern: str = ""):
             """Helper to add triangle with strict deduplication"""
+            nonlocal duplicates_found  # Allow modification of outer scope variable
             # Use sorted tuple for strict deduplication (order-independent)
             key = tuple(sorted([x.upper(), y.upper()]))
             if key in triangle_set:
