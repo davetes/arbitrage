@@ -617,7 +617,10 @@ def find_random_routes(
         if len(usdt_assets) < 10:
             logger.warning(f"Need at least 10 assets trading with {base}")
             return [], stats
-        
+
+        top_symbols = [f"{asset}{base}" for asset in usdt_assets[:200]]
+        _book_ticker_stream.start(top_symbols)
+        logger.info(f"WebSocket started for {len(top_symbols)} symbols") 
         # Build cross pairs map for faster checking
         cross_pairs = set()
         for sym, info in symbols.items():
