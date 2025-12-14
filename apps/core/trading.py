@@ -78,7 +78,9 @@ def execute_cycle(route: CandidateRoute, notional_usd: float) -> Tuple[float, Li
                 raise RuntimeError(f"Asset mismatch for leg {leg}. Have {current_asset}, need {quote}")
             if current_amount < min_notional:
                 raise RuntimeError(f"Amount {current_amount} below min notional {min_notional} for {symbol}")
-            order = client.new_order(symbol=symbol, side="BUY", type="MARKET", quoteOrderQty=current_amount)
+            # Round quoteOrderQty to 8 decimal places to avoid precision errors
+            rounded_quote_qty = round(current_amount, 8)
+            order = client.new_order(symbol=symbol, side="BUY", type="MARKET", quoteOrderQty=rounded_quote_qty)
             qty_out = sum(float(f["qty"]) for f in order.get("fills", [])) if order.get("fills") else float(order.get("executedQty", 0))
             current_asset = base
             current_amount = qty_out
