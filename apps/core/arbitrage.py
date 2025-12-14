@@ -16,6 +16,14 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 logger = logging.getLogger(__name__)
 
+# Major coins that must be included in the middle leg of routes
+MAJOR_COINS = {
+    "BTC", "ETH", "BNB", "SOL", "ADA", "XRP", "DOGE", "MATIC",
+    "AVAX", "DOT", "LINK", "UNI", "ATOM", "LTC", "ETC", "XLM",
+    "ALGO", "VET", "FIL", "TRX", "EOS", "AAVE", "SXP", "CHZ",
+    "BICO", "LISTA", "APT", "ARB", "OP", "SUI", "SEI", "TIA"
+}
+
 
 class DepthCache:
     """Cache for order book depth snapshots with TTL"""
@@ -421,11 +429,21 @@ def _try_random_triangle(
     """
     Simple triangle check for random exploration.
     Returns route if profit is within target range.
+    Middle leg must include at least one major coin.
     """
     def get_depth(symbol: str) -> Optional[dict]:
         if depth_cache is not None:
             return depth_cache.get(symbol)
         return _depth_snapshot(client, symbol, use_cache=True)
+    
+    # Ensure middle leg includes at least one major coin
+    # The middle leg is the cross pair between x and y, so either x or y must be a major coin
+    x_upper = x.upper()
+    y_upper = y.upper()
+    if x_upper not in MAJOR_COINS and y_upper not in MAJOR_COINS:
+        if stats is not None:
+            stats["filtered_no_major_coin"] = stats.get("filtered_no_major_coin", 0) + 1
+        return None
     
     # Required symbols
     symbol1 = f"{x}{base}"  # X/USDT
@@ -586,6 +604,7 @@ def find_random_routes(
         "routes_found": 0,
         "filtered_profit": 0,
         "filtered_missing_pairs": 0,
+        "filtered_no_major_coin": 0,
         "unique_assets_tried": set(),
         "unique_pairs_tried": set(),
         "start_time": start_time,
@@ -603,6 +622,7 @@ def find_random_routes(
         
         # Get ALL assets that trade with USDT
         usdt_assets = []
+        major_assets = []
         for sym, info in symbols.items():
             if info.get("status") != "TRADING":
                 continue
@@ -611,8 +631,11 @@ def find_random_routes(
             
             if quote == base and base_asset != base:
                 usdt_assets.append(base_asset)
+                if base_asset in MAJOR_COINS:
+                    major_assets.append(base_asset)
         
         logger.info(f"Found {len(usdt_assets)} assets trading with {base}")
+        logger.info(f"Found {len(major_assets)} major coins trading with {base}: {major_assets[:10]}...")
         
         if len(usdt_assets) < 10:
             logger.warning(f"Need at least 10 assets trading with {base}")
@@ -661,12 +684,27 @@ def find_random_routes(
             attempts += batch_attempts
             
             # Generate random pairs for this batch
+            # Ensure at least one asset in each pair is a major coin (for middle leg requirement)
             random_pairs = []
             for _ in range(batch_attempts):
                 if len(usdt_assets) < 2:
                     break
                 
-                x, y = random.sample(usdt_assets, 2)
+                # Prefer pairs with major coins: 70% chance to include a major coin
+                if major_assets and random.random() < 0.7:
+                    # Pick one major coin and one random asset
+                    x = random.choice(major_assets)
+                    y = random.choice(usdt_assets)
+                    # Ensure they're different
+                    while y == x:
+                        y = random.choice(usdt_assets)
+                else:
+                    # Random pair, but still check if at least one is major
+                    x, y = random.sample(usdt_assets, 2)
+                    # If neither is major, skip this pair (will be filtered later anyway)
+                    if x not in MAJOR_COINS and y not in MAJOR_COINS:
+                        continue
+                
                 pair_key = tuple(sorted([x, y]))
                 
                 if pair_key in seen_pairs:
@@ -767,6 +805,8 @@ def find_random_routes(
         logger.info(f"Total time: {total_time:.2f}s")
         logger.info(f"Unique assets explored: {len(stats['unique_assets_tried'])}")
         logger.info(f"Unique pairs explored: {len(stats['unique_pairs_tried'])}")
+        if stats.get("filtered_no_major_coin", 0) > 0:
+            logger.info(f"Filtered (no major coin in middle leg): {stats['filtered_no_major_coin']}")
         
         if cand:
             profits = [r.profit_pct for r in cand]
