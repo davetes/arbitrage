@@ -48,8 +48,8 @@ class DepthCache:
         self._cache.clear()
 
 
-# Global depth cache instance (2 second TTL)
-_depth_cache = DepthCache(ttl_seconds=2.0)
+# Global depth cache instance (longer TTL to reduce API calls)
+_depth_cache = DepthCache(ttl_seconds=10.0)  # Increased from 2s to 10s
 
 
 class _BookTickerStream:
@@ -365,8 +365,8 @@ def _load_symbols(client: BinanceClient) -> Dict[str, dict]:
 
 
 def _depth_snapshot(client: BinanceClient, symbol: str, depth: int = 20, use_cache: bool = True) -> Optional[dict]:
-    """Get depth snapshot from websocket cache first, then REST with caching and retries."""
-    # Try websocket bookTicker cache first
+    """Get depth snapshot with aggressive caching and rate limit protection."""
+    # Try websocket bookTicker cache first (even if disabled, may have old data)
     ws_data = _book_ticker_stream.get(symbol)
     if ws_data:
         return ws_data
@@ -376,10 +376,11 @@ def _depth_snapshot(client: BinanceClient, symbol: str, depth: int = 20, use_cac
         if cached is not None:
             return cached
     
-    backoff = 0.25
-    for attempt in range(3):
+    # Rate limit protection: longer delays and fewer retries
+    backoff = 0.5  # Start with longer delay
+    for attempt in range(2):  # Reduce retries from 3 to 2
         try:
-            d = client.depth(symbol, limit=depth)
+            d = client.depth(symbol, limit=5)  # Use smaller depth (5 instead of 20)
             if not d.get("asks") or not d.get("bids"):
                 return None
             ask_p, ask_q = float(d["asks"][0][0]), float(d["asks"][0][1])
@@ -404,12 +405,11 @@ def _depth_snapshot(client: BinanceClient, symbol: str, depth: int = 20, use_cac
         except Exception as e:
             error_str = str(e).lower()
             if "too much request weight" in error_str or "banned" in error_str or "429" in error_str:
-                if attempt == 0:
-                    logger.warning(f"Rate limit detected while fetching {symbol}, waiting longer...")
-                time.sleep(min(backoff * 4, 5.0))
+                logger.warning(f"Rate limit hit for {symbol}, waiting {backoff * 6:.1f}s...")
+                time.sleep(backoff * 6)  # Much longer wait for rate limits
             else:
                 time.sleep(backoff)
-            backoff *= 2
+            backoff *= 3  # Increase backoff more aggressively
     return None
 
 
@@ -676,8 +676,8 @@ def find_random_routes(
             return [], stats
 
         top_symbols = [f"{asset}{base}" for asset in usdt_assets[:200]]
-        _book_ticker_stream.start(top_symbols)
-        logger.info(f"WebSocket started for {len(top_symbols)} symbols") 
+        # _book_ticker_stream.start(top_symbols)  # WebSocket disabled
+        logger.info(f"WebSocket disabled - using REST API only") 
         
         # Also include major/alt cross pairs in WebSocket
         cross_symbols = []
@@ -692,8 +692,8 @@ def find_random_routes(
                     cross_symbols.append(f"{major}{asset}")
         
         if cross_symbols:
-            _book_ticker_stream.start(list(set(top_symbols + cross_symbols[:500])))
-            logger.info(f"WebSocket updated with {len(cross_symbols[:500])} cross pairs")
+            # _book_ticker_stream.start(list(set(top_symbols + cross_symbols[:500])))  # WebSocket disabled
+            logger.info(f"Cross pairs identified: {len(cross_symbols[:500])} (WebSocket disabled)")
         
         # Exhaustive exploration setup
         cand: List[CandidateRoute] = []
@@ -741,7 +741,7 @@ def find_random_routes(
 
         # Check triangles in parallel or sequentially over all pairs
         if use_parallel and len(all_pairs) > 10:
-            with ThreadPoolExecutor(max_workers=4) as executor:
+            with ThreadPoolExecutor(max_workers=2) as executor:  # Reduce from 4 to 2 workers
                 futures = []
                 for major, alt in all_pairs:
                     futures.append(
