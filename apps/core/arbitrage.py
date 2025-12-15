@@ -432,8 +432,22 @@ def _try_triangle_pattern(
     Returns route if profit is within target range.
     """
     def get_depth(symbol: str) -> Optional[dict]:
+        """Get depth for a symbol using optional local cache, then REST fallback.
+
+        - If depth_cache is provided and has the symbol, return cached depth.
+        - Otherwise, call _depth_snapshot (which has its own global cache and
+          rate limiting), and, if successful, store the result back into
+          depth_cache for reuse within the current scan.
+        """
         if depth_cache is not None:
-            return depth_cache.get(symbol)
+            cached = depth_cache.get(symbol)
+            if cached is not None:
+                return cached
+            depth = _depth_snapshot(client, symbol, use_cache=True)
+            if depth:
+                depth_cache[symbol] = depth
+            return depth
+        # No local depth_cache provided; fall back directly to snapshot helper
         return _depth_snapshot(client, symbol, use_cache=True)
     
     # Validate inputs
