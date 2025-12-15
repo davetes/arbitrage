@@ -16,13 +16,11 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 logger = logging.getLogger(__name__)
 
-# Major coins that must be included in the middle leg of routes
-MAJOR_COINS = {
-    "BTC", "ETH", "BNB", "SOL", "ADA", "XRP", "DOGE", "MATIC",
-    "AVAX", "DOT", "LINK", "UNI", "ATOM", "LTC", "ETC", "XLM",
-    "ALGO", "VET", "FIL", "TRX", "EOS", "AAVE", "SXP", "CHZ",
-    "BICO", "LISTA", "APT", "ARB", "OP", "SUI", "SEI", "TIA"
-}
+# Only these coins are allowed as bridge (middle-leg) assets
+# Patterns:
+#   1) MAJOR/USDT -> X/MAJOR -> X/USDT
+#   2) X/USDT -> MAJOR/X -> MAJOR/USDT
+MAJOR_COINS = {"BTC", "ETH", "BNB"}
 
 
 class DepthCache:
@@ -429,25 +427,30 @@ def _try_random_triangle(
     """
     Simple triangle check for random exploration.
     Returns route if profit is within target range.
-    Middle leg must include at least one major coin.
+    Enforces bridge patterns:
+      - MAJOR/BASE -> X/MAJOR -> X/BASE
+      - X/BASE -> MAJOR/X -> MAJOR/BASE
+    where MAJOR is one of BTC, ETH, BNB and BASE is S.BASE_ASSET.
     """
     def get_depth(symbol: str) -> Optional[dict]:
         if depth_cache is not None:
             return depth_cache.get(symbol)
         return _depth_snapshot(client, symbol, use_cache=True)
     
-    # Ensure middle leg includes at least one major coin
-    # The middle leg is the cross pair between x and y, so either x or y must be a major coin
+    # Enforce exactly one major bridge coin between x and y
     x_upper = x.upper()
     y_upper = y.upper()
-    if x_upper not in MAJOR_COINS and y_upper not in MAJOR_COINS:
+    is_x_major = x_upper in MAJOR_COINS
+    is_y_major = y_upper in MAJOR_COINS
+    # Reject if both are majors or both are non-majors
+    if is_x_major == is_y_major:
         if stats is not None:
-            stats["filtered_no_major_coin"] = stats.get("filtered_no_major_coin", 0) + 1
+            stats["filtered_major_pattern"] = stats.get("filtered_major_pattern", 0) + 1
         return None
     
-    # Required symbols
-    symbol1 = f"{x}{base}"  # X/USDT
-    symbol3 = f"{y}{base}"  # Y/USDT
+    # Required symbols with base (e.g. USDT)
+    symbol1 = f"{x}{base}"  # X/BASE
+    symbol3 = f"{y}{base}"  # Y/BASE
     
     # Check base pairs exist
     if symbol1 not in symbols or symbol3 not in symbols:
@@ -460,7 +463,7 @@ def _try_random_triangle(
     if not d1 or not d3:
         return None
     
-    # Check for cross pair (Y/X or X/Y)
+    # Check for real cross pair (Y/X or X/Y). No synthetic middle leg.
     cross_pair = None
     inverted = False
     
@@ -494,27 +497,10 @@ def _try_random_triangle(
                     cross_pair = symbol2_alt
                     inverted = True
         else:
-            # No cross pair, use synthetic
-            try:
-                synthetic_ask = d3["ask_price"] / d1["bid_price"] if d1["bid_price"] > 0 else None
-                synthetic_bid = d3["bid_price"] / d1["ask_price"] if d1["ask_price"] > 0 else None
-                
-                if synthetic_ask and synthetic_bid and synthetic_ask > 0 and synthetic_bid > 0:
-                    d2 = {
-                        "ask_price": synthetic_ask,
-                        "bid_price": synthetic_bid,
-                        "ask_qty": min(d1["bid_qty"], d3["ask_qty"]),
-                        "bid_qty": min(d1["ask_qty"], d3["bid_qty"]),
-                        "total_ask_qty": min(d1["total_bid_qty"], d3["total_ask_qty"]),
-                        "total_bid_qty": min(d1["total_ask_qty"], d3["total_bid_qty"]),
-                        "cap_ask_quote": 0,
-                        "cap_bid_quote": 0,
-                    }
-                    cross_pair = f"{y}{x}"  # Synthetic
-                else:
-                    return None
-            except Exception:
-                return None
+            # No real cross pair between X and Y
+            if stats is not None:
+                stats["filtered_missing_pairs"] = stats.get("filtered_missing_pairs", 0) + 1
+            return None
     
     if not cross_pair:
         return None
@@ -593,8 +579,8 @@ def find_random_routes(
     use_parallel: bool = True
 ) -> Tuple[List[CandidateRoute], dict]:
     """
-    Pure random exploration for triangular arbitrage opportunities.
-    No scoring, no prioritization - just random sampling.
+    Exhaustive exploration for triangular arbitrage opportunities.
+    Tries all valid (major, alt) combinations instead of random sampling.
     """
     start_time = time.time()
     
@@ -604,7 +590,7 @@ def find_random_routes(
         "routes_found": 0,
         "filtered_profit": 0,
         "filtered_missing_pairs": 0,
-        "filtered_no_major_coin": 0,
+        "filtered_major_pattern": 0,
         "unique_assets_tried": set(),
         "unique_pairs_tried": set(),
         "start_time": start_time,
@@ -615,12 +601,11 @@ def find_random_routes(
         symbols = _load_symbols(client)
         base = S.BASE_ASSET.upper()
         
-        logger.info(f"=== RANDOM EXPLORATION STARTED ===")
+        logger.info(f"=== EXHAUSTIVE EXPLORATION STARTED ===")
         logger.info(f"Target profit: {min_profit_pct}% - {max_profit_pct}%")
-        logger.info(f"Max attempts: {max_attempts}")
-        logger.info(f"Max routes to find: {max_routes}")
+        logger.info(f"Max routes to return: {max_routes}")
         
-        # Get ALL assets that trade with USDT
+        # Get ALL assets that trade with BASE (typically USDT)
         usdt_assets = []
         major_assets = []
         for sym, info in symbols.items():
@@ -636,6 +621,9 @@ def find_random_routes(
         
         logger.info(f"Found {len(usdt_assets)} assets trading with {base}")
         logger.info(f"Found {len(major_assets)} major coins trading with {base}: {major_assets[:10]}...")
+        if not major_assets:
+            logger.warning("No major coins (BTC/ETH/BNB) trading with base asset; cannot build required routes")
+            return [], stats
         
         if len(usdt_assets) < 10:
             logger.warning(f"Need at least 10 assets trading with {base}")
@@ -658,9 +646,8 @@ def find_random_routes(
         
         logger.info(f"Found {len(cross_pairs)} cross pairs")
         
-        # Random exploration
+        # Exhaustive exploration setup
         cand: List[CandidateRoute] = []
-        seen_pairs = set()
         
         # Pre-fetch some depths to speed up checks
         # Fetch depths for most common symbols
@@ -675,57 +662,35 @@ def find_random_routes(
                 depth = _depth_snapshot(client, symbol, use_cache=True)
                 if depth:
                     depth_cache[symbol] = depth
-        
-        attempts = 0
-        batch_size = 50
-        
-        while attempts < max_attempts and len(cand) < max_routes:
-            batch_attempts = min(batch_size, max_attempts - attempts)
-            attempts += batch_attempts
-            
-            # Generate random pairs for this batch
-            # Ensure at least one asset in each pair is a major coin (for middle leg requirement)
-            random_pairs = []
-            for _ in range(batch_attempts):
-                if len(usdt_assets) < 2:
-                    break
-                
-                # Prefer pairs with major coins: 70% chance to include a major coin
-                if major_assets and random.random() < 0.7:
-                    # Pick one major coin and one random asset
-                    x = random.choice(major_assets)
-                    y = random.choice(usdt_assets)
-                    # Ensure they're different
-                    while y == x:
-                        y = random.choice(usdt_assets)
-                else:
-                    # Random pair, but still check if at least one is major
-                    x, y = random.sample(usdt_assets, 2)
-                    # If neither is major, skip this pair (will be filtered later anyway)
-                    if x not in MAJOR_COINS and y not in MAJOR_COINS:
-                        continue
-                
-                pair_key = tuple(sorted([x, y]))
-                
-                if pair_key in seen_pairs:
+
+        # Build full list of (x, y) pairs to test: all oriented (major, alt) and (alt, major)
+        all_pairs: List[Tuple[str, str]] = []
+        seen_pairs: set = set()
+        for major in set(major_assets):
+            for asset in set(usdt_assets):
+                if asset == major:
                     continue
-                
-                seen_pairs.add(pair_key)
-                stats["unique_assets_tried"].add(x)
-                stats["unique_assets_tried"].add(y)
-                stats["unique_pairs_tried"].add(pair_key)
-                
-                random_pairs.append((x, y))
-            
-            if not random_pairs:
-                continue
-            
-            # Check triangles in parallel or sequentially
-            if use_parallel and len(random_pairs) > 10:
-                with ThreadPoolExecutor(max_workers=4) as executor:
-                    futures = []
-                    for x, y in random_pairs:
-                        future = executor.submit(
+                for x, y in ((major, asset), (asset, major)):
+                    pair_key = (x, y)
+                    if pair_key in seen_pairs:
+                        continue
+                    seen_pairs.add(pair_key)
+                    all_pairs.append((x, y))
+                    stats["unique_assets_tried"].add(x)
+                    stats["unique_assets_tried"].add(y)
+                    stats["unique_pairs_tried"].add(tuple(sorted([x, y])))
+
+        stats["attempts"] = len(all_pairs)
+        stats["random_checks"] = len(all_pairs)
+        logger.info(f"Planned exhaustive checks for {len(all_pairs)} (x, y) combinations")
+
+        # Check triangles in parallel or sequentially over all pairs
+        if use_parallel and len(all_pairs) > 10:
+            with ThreadPoolExecutor(max_workers=4) as executor:
+                futures = []
+                for x, y in all_pairs:
+                    futures.append(
+                        executor.submit(
                             _try_random_triangle,
                             client=client,
                             symbols=symbols,
@@ -735,58 +700,65 @@ def find_random_routes(
                             min_profit_pct=min_profit_pct,
                             max_profit_pct=max_profit_pct,
                             depth_cache=depth_cache,
-                            stats=stats
+                            stats=stats,
                         )
-                        futures.append(future)
-                    
-                    for future in as_completed(futures):
-                        try:
-                            route = future.result()
-                            if route:
-                                # Check for duplicates
-                                route_key = (route.a, route.b, route.c)
-                                if not any(r.a == route.a and r.b == route.b and r.c == route.c for r in cand):
-                                    cand.append(route)
-                                    logger.info(f"✅ Found route #{len(cand)}: {route.profit_pct}% profit")
-                                    
-                                    if len(cand) >= max_routes:
-                                        break
-                        except Exception as e:
-                            logger.debug(f"Triangle check failed: {e}")
-            else:
-                # Sequential checking
-                for x, y in random_pairs:
-                    route = _try_random_triangle(
-                        client=client,
-                        symbols=symbols,
-                        base=base,
-                        x=x,
-                        y=y,
-                        min_profit_pct=min_profit_pct,
-                        max_profit_pct=max_profit_pct,
-                        depth_cache=depth_cache,
-                        stats=stats
                     )
-                    
-                    if route:
-                        # Check for duplicates
-                        route_key = (route.a, route.b, route.c)
-                        if not any(r.a == route.a and r.b == route.b and r.c == route.c for r in cand):
-                            cand.append(route)
-                            logger.info(f"✅ Found route #{len(cand)}: {route.profit_pct}% profit")
-                            
-                            if len(cand) >= max_routes:
-                                break
-            
-            stats["attempts"] = attempts
-            stats["random_checks"] = len(seen_pairs)
-            
-            # Log progress every 100 attempts
-            if attempts % 100 == 0:
-                elapsed = time.time() - start_time
-                logger.info(f"Progress: {attempts}/{max_attempts} attempts, {len(cand)}/{max_routes} routes found, {elapsed:.1f}s elapsed")
-                logger.info(f"Unique assets tried: {len(stats['unique_assets_tried'])}/{len(usdt_assets)}")
-                logger.info(f"Unique pairs tried: {len(stats['unique_pairs_tried'])}")
+
+                for i, future in enumerate(as_completed(futures), start=1):
+                    try:
+                        route = future.result()
+                        if route:
+                            route_key = (route.a, route.b, route.c)
+                            if not any(
+                                r.a == route.a and r.b == route.b and r.c == route.c
+                                for r in cand
+                            ):
+                                cand.append(route)
+                                logger.info(
+                                    f"✅ Found route #{len(cand)}: {route.profit_pct}% profit"
+                                )
+                    except Exception as e:
+                        logger.debug(f"Triangle check failed: {e}")
+
+                    # Periodic progress logging
+                    if i % 100 == 0:
+                        elapsed = time.time() - start_time
+                        logger.info(
+                            f"Progress: {i}/{len(all_pairs)} combinations checked, "
+                            f"{len(cand)} routes found, {elapsed:.1f}s elapsed"
+                        )
+        else:
+            # Sequential exhaustive checking
+            for i, (x, y) in enumerate(all_pairs, start=1):
+                route = _try_random_triangle(
+                    client=client,
+                    symbols=symbols,
+                    base=base,
+                    x=x,
+                    y=y,
+                    min_profit_pct=min_profit_pct,
+                    max_profit_pct=max_profit_pct,
+                    depth_cache=depth_cache,
+                    stats=stats,
+                )
+
+                if route:
+                    route_key = (route.a, route.b, route.c)
+                    if not any(
+                        r.a == route.a and r.b == route.b and r.c == route.c
+                        for r in cand
+                    ):
+                        cand.append(route)
+                        logger.info(
+                            f"✅ Found route #{len(cand)}: {route.profit_pct}% profit"
+                        )
+
+                if i % 100 == 0:
+                    elapsed = time.time() - start_time
+                    logger.info(
+                        f"Progress: {i}/{len(all_pairs)} combinations checked, "
+                        f"{len(cand)} routes found, {elapsed:.1f}s elapsed"
+                    )
         
         # Calculate final stats
         total_time = time.time() - start_time
@@ -805,8 +777,8 @@ def find_random_routes(
         logger.info(f"Total time: {total_time:.2f}s")
         logger.info(f"Unique assets explored: {len(stats['unique_assets_tried'])}")
         logger.info(f"Unique pairs explored: {len(stats['unique_pairs_tried'])}")
-        if stats.get("filtered_no_major_coin", 0) > 0:
-            logger.info(f"Filtered (no major coin in middle leg): {stats['filtered_no_major_coin']}")
+        if stats.get("filtered_major_pattern", 0) > 0:
+            logger.info(f"Filtered (invalid major/non-major pattern): {stats['filtered_major_pattern']}")
         
         if cand:
             profits = [r.profit_pct for r in cand]
