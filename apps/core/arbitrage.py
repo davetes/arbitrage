@@ -18,8 +18,8 @@ logger = logging.getLogger(__name__)
 
 # Only these coins are allowed as bridge (middle-leg) assets
 # Patterns:
-#   1) MAJOR/USDT -> X/MAJOR -> X/USDT
-#   2) X/USDT -> MAJOR/X -> MAJOR/USDT
+#   1) MAJOR/USDT -> X/MAJOR -> X/USDT  (Example: BTC/USDT -> RAD/BTC -> RAD/USDT)
+#   2) X/USDT -> MAJOR/X -> MAJOR/USDT  (Example: RUNE/USDT -> RUNE/BNB -> BNB/USDT)
 MAJOR_COINS = {"BTC", "ETH", "BNB"}
 
 
@@ -413,6 +413,173 @@ def _depth_snapshot(client: BinanceClient, symbol: str, depth: int = 20, use_cac
     return None
 
 
+def _try_triangle_pattern(
+    client: BinanceClient, 
+    symbols: Dict[str, dict], 
+    base: str, 
+    major: str, 
+    alt: str,
+    min_profit_pct: float,
+    max_profit_pct: float,
+    depth_cache: Dict[str, Optional[dict]] = None,
+    stats: dict = None
+) -> Optional[CandidateRoute]:
+    """
+    Check triangle patterns exactly as shown in screenshots:
+    Pattern 1: MAJOR/USDT -> ALT/MAJOR -> ALT/USDT  (Buy-Buy-Sell)
+    Pattern 2: ALT/USDT -> ALT/MAJOR -> MAJOR/USDT  (Buy-Sell-Sell)
+    
+    Returns route if profit is within target range.
+    """
+    def get_depth(symbol: str) -> Optional[dict]:
+        if depth_cache is not None:
+            return depth_cache.get(symbol)
+        return _depth_snapshot(client, symbol, use_cache=True)
+    
+    # Validate inputs
+    if major not in MAJOR_COINS:
+        return None
+    
+    # PATTERN 1: MAJOR/BASE -> ALT/MAJOR -> ALT/BASE
+    pattern1_symbols = [
+        f"{major}{base}",    # MAJOR/BASE (e.g., BTC/USDT)
+        f"{alt}{major}",     # ALT/MAJOR  (e.g., RAD/BTC)
+        f"{alt}{base}"       # ALT/BASE   (e.g., RAD/USDT)
+    ]
+    
+    # PATTERN 2: ALT/BASE -> ALT/MAJOR -> MAJOR/BASE
+    pattern2_symbols = [
+        f"{alt}{base}",      # ALT/BASE   (e.g., RUNE/USDT)
+        f"{alt}{major}",     # ALT/MAJOR  (e.g., RUNE/BNB)
+        f"{major}{base}"     # MAJOR/BASE (e.g., BNB/USDT)
+    ]
+    
+    # Check if Pattern 1 symbols exist
+    pattern1_valid = all(sym in symbols for sym in pattern1_symbols)
+    pattern2_valid = all(sym in symbols for sym in pattern2_symbols)
+    
+    if not pattern1_valid and not pattern2_valid:
+        # Check for inverted cross pair (MAJOR/ALT instead of ALT/MAJOR)
+        alt_major_inverted = f"{major}{alt}"
+        if alt_major_inverted in symbols:
+            # We have MAJOR/ALT instead of ALT/MAJOR, but we can still try patterns
+            pattern1_symbols[1] = alt_major_inverted  # Use MAJOR/ALT for pattern 1
+            pattern2_symbols[1] = alt_major_inverted  # Use MAJOR/ALT for pattern 2
+            pattern1_valid = all(sym in symbols for sym in pattern1_symbols)
+            pattern2_valid = all(sym in symbols for sym in pattern2_symbols)
+    
+    if not pattern1_valid and not pattern2_valid:
+        return None
+    
+    best_route = None
+    best_profit = -999
+    
+    # Try Pattern 1: MAJOR/BASE -> ALT/MAJOR -> ALT/BASE
+    if pattern1_valid:
+        d1 = get_depth(pattern1_symbols[0])  # MAJOR/BASE
+        d2 = get_depth(pattern1_symbols[1])  # ALT/MAJOR or MAJOR/ALT
+        d3 = get_depth(pattern1_symbols[2])  # ALT/BASE
+        
+        if d1 and d2 and d3:
+            # Check if we have ALT/MAJOR or MAJOR/ALT
+            is_inverted = pattern1_symbols[1].startswith(major)
+            
+            if is_inverted:
+                # We have MAJOR/ALT, need to invert for calculation
+                # For Pattern 1 with MAJOR/ALT: Buy MAJOR/BASE -> Sell MAJOR/ALT -> Buy ALT/BASE? Wait, that's wrong.
+                # Actually, Pattern 1 needs: Buy MAJOR, Buy ALT with MAJOR
+                # If we have MAJOR/ALT, then selling MAJOR/ALT means buying ALT with MAJOR
+                # So: 1. Buy MAJOR with BASE, 2. Sell MAJOR for ALT, 3. Sell ALT for BASE
+                amount = 1.0
+                amount = amount / d1["ask_price"]        # Buy MAJOR with BASE
+                amount = amount * d2["bid_price"]        # Sell MAJOR for ALT (using MAJOR/ALT bid)
+                amount = amount * d3["bid_price"]        # Sell ALT for BASE
+                profit1 = (amount - 1.0) * 100.0
+            else:
+                # Normal ALT/MAJOR pair
+                amount = 1.0
+                amount = amount / d1["ask_price"]        # Buy MAJOR with BASE
+                amount = amount / d2["ask_price"]        # Buy ALT with MAJOR
+                amount = amount * d3["bid_price"]        # Sell ALT for BASE
+                profit1 = (amount - 1.0) * 100.0
+            
+            if -50 < profit1 < 50 and profit1 > best_profit:
+                best_profit = profit1
+                if is_inverted:
+                    best_route = CandidateRoute(
+                        a=f"{major}/{base} buy",
+                        b=f"{major}/{alt} sell",  # Selling MAJOR/ALT means buying ALT with MAJOR
+                        c=f"{alt}/{base} sell",
+                        profit_pct=round(profit1, 4),
+                        volume_usd=round(S.MAX_NOTIONAL_USD, 2),
+                    )
+                else:
+                    best_route = CandidateRoute(
+                        a=f"{major}/{base} buy",
+                        b=f"{alt}/{major} buy",
+                        c=f"{alt}/{base} sell",
+                        profit_pct=round(profit1, 4),
+                        volume_usd=round(S.MAX_NOTIONAL_USD, 2),
+                    )
+    
+    # Try Pattern 2: ALT/BASE -> ALT/MAJOR -> MAJOR/BASE
+    if pattern2_valid:
+        d1 = get_depth(pattern2_symbols[0])  # ALT/BASE
+        d2 = get_depth(pattern2_symbols[1])  # ALT/MAJOR or MAJOR/ALT
+        d3 = get_depth(pattern2_symbols[2])  # MAJOR/BASE
+        
+        if d1 and d2 and d3:
+            # Check if we have ALT/MAJOR or MAJOR/ALT
+            is_inverted = pattern2_symbols[1].startswith(major)
+            
+            if is_inverted:
+                # We have MAJOR/ALT, need to invert for calculation
+                # For Pattern 2 with MAJOR/ALT: Buy ALT/BASE -> Buy MAJOR/ALT -> Sell MAJOR/BASE
+                amount = 1.0
+                amount = amount / d1["ask_price"]        # Buy ALT with BASE
+                amount = amount / d2["ask_price"]        # Buy MAJOR with ALT (using MAJOR/ALT ask)
+                amount = amount * d3["bid_price"]        # Sell MAJOR for BASE
+                profit2 = (amount - 1.0) * 100.0
+            else:
+                # Normal ALT/MAJOR pair
+                amount = 1.0
+                amount = amount / d1["ask_price"]        # Buy ALT with BASE
+                amount = amount * d2["bid_price"]        # Sell ALT for MAJOR
+                amount = amount * d3["bid_price"]        # Sell MAJOR for BASE
+                profit2 = (amount - 1.0) * 100.0
+            
+            if -50 < profit2 < 50 and profit2 > best_profit:
+                best_profit = profit2
+                if is_inverted:
+                    best_route = CandidateRoute(
+                        a=f"{alt}/{base} buy",
+                        b=f"{major}/{alt} buy",  # Buying MAJOR/ALT means selling ALT for MAJOR
+                        c=f"{major}/{base} sell",
+                        profit_pct=round(profit2, 4),
+                        volume_usd=round(S.MAX_NOTIONAL_USD, 2),
+                    )
+                else:
+                    best_route = CandidateRoute(
+                        a=f"{alt}/{base} buy",
+                        b=f"{alt}/{major} sell",
+                        c=f"{major}/{base} sell",
+                        profit_pct=round(profit2, 4),
+                        volume_usd=round(S.MAX_NOTIONAL_USD, 2),
+                    )
+    
+    # Check if best profit is in target range
+    if best_route and min_profit_pct <= best_route.profit_pct <= max_profit_pct:
+        if stats is not None:
+            stats["routes_found"] = stats.get("routes_found", 0) + 1
+        logger.info(f"FOUND: {best_route.a} → {best_route.b} → {best_route.c}, profit: {best_route.profit_pct}%")
+        return best_route
+    elif best_route:
+        if stats is not None:
+            stats["filtered_profit"] = stats.get("filtered_profit", 0) + 1
+    
+    return None
+
+
 def _try_random_triangle(
     client: BinanceClient, 
     symbols: Dict[str, dict], 
@@ -425,148 +592,27 @@ def _try_random_triangle(
     stats: dict = None
 ) -> Optional[CandidateRoute]:
     """
-    Simple triangle check for random exploration.
-    Returns route if profit is within target range.
-    Enforces bridge patterns:
-      - MAJOR/BASE -> X/MAJOR -> X/BASE
-      - X/BASE -> MAJOR/X -> MAJOR/BASE
-    where MAJOR is one of BTC, ETH, BNB and BASE is S.BASE_ASSET.
+    Wrapper for backward compatibility - calls the new pattern-based function.
+    Determines which coin is major and which is alt, then calls _try_triangle_pattern.
     """
-    def get_depth(symbol: str) -> Optional[dict]:
-        if depth_cache is not None:
-            return depth_cache.get(symbol)
-        return _depth_snapshot(client, symbol, use_cache=True)
-    
-    # Enforce exactly one major bridge coin between x and y
-    x_upper = x.upper()
-    y_upper = y.upper()
-    is_x_major = x_upper in MAJOR_COINS
-    is_y_major = y_upper in MAJOR_COINS
-    # Reject if both are majors or both are non-majors
-    if is_x_major == is_y_major:
+    # Determine which is major and which is alt
+    if x in MAJOR_COINS and y not in MAJOR_COINS:
+        # x is major, y is alt
+        return _try_triangle_pattern(
+            client, symbols, base, x, y, 
+            min_profit_pct, max_profit_pct, depth_cache, stats
+        )
+    elif y in MAJOR_COINS and x not in MAJOR_COINS:
+        # y is major, x is alt
+        return _try_triangle_pattern(
+            client, symbols, base, y, x, 
+            min_profit_pct, max_profit_pct, depth_cache, stats
+        )
+    else:
+        # Both are majors or both are alts - invalid for our patterns
         if stats is not None:
             stats["filtered_major_pattern"] = stats.get("filtered_major_pattern", 0) + 1
         return None
-    
-    # Required symbols with base (e.g. USDT)
-    symbol1 = f"{x}{base}"  # X/BASE
-    symbol3 = f"{y}{base}"  # Y/BASE
-    
-    # Check base pairs exist
-    if symbol1 not in symbols or symbol3 not in symbols:
-        return None
-    
-    # Get depths
-    d1 = get_depth(symbol1)
-    d3 = get_depth(symbol3)
-    
-    if not d1 or not d3:
-        return None
-    
-    # Check for real cross pair (Y/X or X/Y). No synthetic middle leg.
-    cross_pair = None
-    inverted = False
-    
-    # Try Y/X first (preferred)
-    symbol2 = f"{y}{x}"
-    if symbol2 in symbols:
-        cross_pair = symbol2
-        d2 = get_depth(symbol2)
-    else:
-        # Try X/Y (inverted)
-        symbol2_alt = f"{x}{y}"
-        if symbol2_alt in symbols:
-            orig = get_depth(symbol2_alt)
-            if orig:
-                try:
-                    inv_ask = 1.0 / orig["bid_price"] if orig["bid_price"] else None
-                    inv_bid = 1.0 / orig["ask_price"] if orig["ask_price"] else None
-                except Exception:
-                    inv_ask = inv_bid = None
-                if inv_ask and inv_bid:
-                    d2 = {
-                        "ask_price": inv_ask,
-                        "bid_price": inv_bid,
-                        "ask_qty": orig.get("bid_qty", 0),
-                        "bid_qty": orig.get("ask_qty", 0),
-                        "total_ask_qty": orig.get("total_bid_qty", 0),
-                        "total_bid_qty": orig.get("total_ask_qty", 0),
-                        "cap_ask_quote": 0,
-                        "cap_bid_quote": 0,
-                    }
-                    cross_pair = symbol2_alt
-                    inverted = True
-        else:
-            # No real cross pair between X and Y
-            if stats is not None:
-                stats["filtered_missing_pairs"] = stats.get("filtered_missing_pairs", 0) + 1
-            return None
-    
-    if not cross_pair:
-        return None
-    
-    # Calculate profit for both patterns
-    # Pattern 1: BUY-BUY-SELL
-    amount = 1.0
-    amount = amount / d1["ask_price"]  # Buy X with USDT
-    amount = amount / d2["ask_price"]  # Buy Y with X
-    amount = amount * d3["bid_price"]  # Sell Y for USDT
-    profit1 = (amount - 1.0) * 100.0
-    
-    # Pattern 2: BUY-SELL-SELL
-    amount = 1.0
-    amount = amount / d1["ask_price"]  # Buy X with USDT
-    amount = amount * d2["bid_price"]  # Sell X for Y
-    amount = amount * d3["bid_price"]  # Sell Y for USDT
-    profit2 = (amount - 1.0) * 100.0
-    
-    # Use best profit
-    gross_profit_pct = max(profit1, profit2)
-    
-    # Validate profit is reasonable
-    if gross_profit_pct < -50 or gross_profit_pct > 50:
-        return None
-    
-    # Check if profit is in target range
-    if gross_profit_pct < min_profit_pct or gross_profit_pct > max_profit_pct:
-        if stats is not None:
-            stats["filtered_profit"] = stats.get("filtered_profit", 0) + 1
-        return None
-    
-    # Determine which pattern gave the best profit
-    best_pattern = "BUY-BUY-SELL" if profit1 >= profit2 else "BUY-SELL-SELL"
-    
-    # Calculate fees
-    fee_rate = (S.FEE_RATE_BPS + S.EXTRA_FEE_BPS) / 10000.0
-    total_fee = 3 * fee_rate
-    gross_multiplier = 1.0 + (gross_profit_pct / 100.0)
-    net_multiplier = gross_multiplier * (1.0 - total_fee)
-    net_profit_pct = (net_multiplier - 1.0) * 100.0
-    
-    # Create route
-    if best_pattern == "BUY-BUY-SELL":
-        route = CandidateRoute(
-            a=f"{x}/{base} buy",
-            b=f"{y}/{x} buy",
-            c=f"{y}/{base} sell",
-            profit_pct=round(gross_profit_pct, 4),
-            volume_usd=round(S.MAX_NOTIONAL_USD, 2),
-        )
-    else:
-        route = CandidateRoute(
-            a=f"{x}/{base} buy",
-            b=f"{y}/{x} sell",
-            c=f"{y}/{base} sell",
-            profit_pct=round(gross_profit_pct, 4),
-            volume_usd=round(S.MAX_NOTIONAL_USD, 2),
-        )
-    
-    if stats is not None:
-        stats["routes_found"] = stats.get("routes_found", 0) + 1
-    
-    logger.info(f"RANDOM FOUND: {route.a} → {route.b} → {route.c}, profit: {route.profit_pct}%")
-    
-    return route
 
 
 def find_random_routes(
@@ -632,19 +678,22 @@ def find_random_routes(
         top_symbols = [f"{asset}{base}" for asset in usdt_assets[:200]]
         _book_ticker_stream.start(top_symbols)
         logger.info(f"WebSocket started for {len(top_symbols)} symbols") 
-        # Build cross pairs map for faster checking
-        cross_pairs = set()
-        for sym, info in symbols.items():
-            if info.get("status") != "TRADING":
-                continue
-            quote = info.get("quoteAsset", "").upper()
-            base_asset = info.get("baseAsset", "").upper()
-            
-            if base_asset in usdt_assets and quote in usdt_assets:
-                cross_pairs.add((base_asset, quote))
-                cross_pairs.add((quote, base_asset))  # Both directions
         
-        logger.info(f"Found {len(cross_pairs)} cross pairs")
+        # Also include major/alt cross pairs in WebSocket
+        cross_symbols = []
+        for major in major_assets:
+            for asset in usdt_assets:
+                if asset == major or asset in MAJOR_COINS:
+                    continue
+                # Check both directions
+                if f"{asset}{major}" in symbols:
+                    cross_symbols.append(f"{asset}{major}")
+                elif f"{major}{asset}" in symbols:
+                    cross_symbols.append(f"{major}{asset}")
+        
+        if cross_symbols:
+            _book_ticker_stream.start(list(set(top_symbols + cross_symbols[:500])))
+            logger.info(f"WebSocket updated with {len(cross_symbols[:500])} cross pairs")
         
         # Exhaustive exploration setup
         cand: List[CandidateRoute] = []
@@ -655,6 +704,10 @@ def find_random_routes(
         for asset in random.sample(usdt_assets, min(100, len(usdt_assets))):
             common_symbols.append(f"{asset}{base}")
         
+        # Add major/base pairs
+        for major in major_assets:
+            common_symbols.append(f"{major}{base}")
+        
         depth_cache = {}
         if common_symbols:
             logger.info(f"Pre-fetching depths for {len(common_symbols)} common symbols...")
@@ -663,40 +716,42 @@ def find_random_routes(
                 if depth:
                     depth_cache[symbol] = depth
 
-        # Build full list of (x, y) pairs to test: all oriented (major, alt) and (alt, major)
+        # Build full list of (major, alt) pairs to test
         all_pairs: List[Tuple[str, str]] = []
         seen_pairs: set = set()
+        
+        # Generate all valid (major, alt) combinations
         for major in set(major_assets):
-            for asset in set(usdt_assets):
-                if asset == major:
+            for alt in set(usdt_assets):
+                if alt == major or alt in MAJOR_COINS:
                     continue
-                for x, y in ((major, asset), (asset, major)):
-                    pair_key = (x, y)
-                    if pair_key in seen_pairs:
-                        continue
-                    seen_pairs.add(pair_key)
-                    all_pairs.append((x, y))
-                    stats["unique_assets_tried"].add(x)
-                    stats["unique_assets_tried"].add(y)
-                    stats["unique_pairs_tried"].add(tuple(sorted([x, y])))
-
+                
+                pair_key = (major, alt)
+                if pair_key in seen_pairs:
+                    continue
+                seen_pairs.add(pair_key)
+                all_pairs.append((major, alt))
+                stats["unique_assets_tried"].add(major)
+                stats["unique_assets_tried"].add(alt)
+                stats["unique_pairs_tried"].add(tuple(sorted([major, alt])))
+        
         stats["attempts"] = len(all_pairs)
         stats["random_checks"] = len(all_pairs)
-        logger.info(f"Planned exhaustive checks for {len(all_pairs)} (x, y) combinations")
+        logger.info(f"Planned exhaustive checks for {len(all_pairs)} (major, alt) combinations")
 
         # Check triangles in parallel or sequentially over all pairs
         if use_parallel and len(all_pairs) > 10:
             with ThreadPoolExecutor(max_workers=4) as executor:
                 futures = []
-                for x, y in all_pairs:
+                for major, alt in all_pairs:
                     futures.append(
                         executor.submit(
-                            _try_random_triangle,
+                            _try_triangle_pattern,
                             client=client,
                             symbols=symbols,
                             base=base,
-                            x=x,
-                            y=y,
+                            major=major,
+                            alt=alt,
                             min_profit_pct=min_profit_pct,
                             max_profit_pct=max_profit_pct,
                             depth_cache=depth_cache,
@@ -729,13 +784,13 @@ def find_random_routes(
                         )
         else:
             # Sequential exhaustive checking
-            for i, (x, y) in enumerate(all_pairs, start=1):
-                route = _try_random_triangle(
+            for i, (major, alt) in enumerate(all_pairs, start=1):
+                route = _try_triangle_pattern(
                     client=client,
                     symbols=symbols,
                     base=base,
-                    x=x,
-                    y=y,
+                    major=major,
+                    alt=alt,
                     min_profit_pct=min_profit_pct,
                     max_profit_pct=max_profit_pct,
                     depth_cache=depth_cache,
@@ -770,8 +825,8 @@ def find_random_routes(
             stats["success_rate"] = round(success_rate, 4)
         
         # Log results
-        logger.info(f"=== RANDOM EXPLORATION COMPLETE ===")
-        logger.info(f"Total attempts: {stats['attempts']}")
+        logger.info(f"=== EXPLORATION COMPLETE ===")
+        logger.info(f"Total checks: {stats['attempts']}")
         logger.info(f"Routes found: {len(cand)}")
         logger.info(f"Success rate: {stats.get('success_rate', 0):.4f}%")
         logger.info(f"Total time: {total_time:.2f}s")
@@ -853,8 +908,21 @@ def revalidate_route(route: CandidateRoute) -> Optional[CandidateRoute]:
         c_base, c_quote, _ = _parse_leg(route.c)
         base = S.BASE_ASSET.upper()
         
-        x = a_base
-        y = c_base
+        # Extract major and alt from the route
+        # Pattern 1: MAJOR/BASE buy -> ALT/MAJOR buy -> ALT/BASE sell
+        # Pattern 2: ALT/BASE buy -> ALT/MAJOR sell -> MAJOR/BASE sell
+        
+        if "buy" in route.a and "buy" in route.b and "sell" in route.c:
+            # Pattern 1
+            major = a_base  # First leg base is major
+            alt = c_base    # Third leg base is alt
+        elif "buy" in route.a and "sell" in route.b and "sell" in route.c:
+            # Pattern 2
+            major = c_base  # Third leg base is major
+            alt = a_base    # First leg base is alt
+        else:
+            logger.warning(f"Cannot determine pattern for route: {route}")
+            return None
         
         client = _client()
         symbols = _load_symbols(client)
@@ -865,20 +933,20 @@ def revalidate_route(route: CandidateRoute) -> Optional[CandidateRoute]:
         max_prof = 50.0
         
         # Re-run triangle check
-        new_route = _try_random_triangle(
+        new_route = _try_triangle_pattern(
             client, 
             symbols, 
             base, 
-            x, 
-            y,
+            major, 
+            alt,
             min_profit_pct=min_prof,
             max_profit_pct=max_prof
         )
         
         if new_route:
-            logger.info(f"Route revalidated: {x}/{base}->{y}/{x}->{y}/{base} profit={new_route.profit_pct:.4f}%")
+            logger.info(f"Route revalidated: {major}/{base}->{alt}/{major}->{alt}/{base} profit={new_route.profit_pct:.4f}%")
         else:
-            logger.warning(f"Route validation failed: {x}/{base}->{y}/{x}->{y}/{base}")
+            logger.warning(f"Route validation failed: {major}/{base}->{alt}/{major}->{alt}/{base}")
         
         return new_route
     except Exception as e:
@@ -888,7 +956,7 @@ def revalidate_route(route: CandidateRoute) -> Optional[CandidateRoute]:
 
 def debug_random_exploration():
     """Debug function to test random exploration"""
-    print("\n=== TESTING RANDOM EXPLORATION ===")
+    print("\n=== TESTING EXPLORATION ===")
     
     # Test with wide profit range to see what's available
     routes, stats = find_random_routes(
