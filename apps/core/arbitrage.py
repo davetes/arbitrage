@@ -941,9 +941,11 @@ def revalidate_route(route: CandidateRoute) -> Optional[CandidateRoute]:
         client = _client()
         symbols = _load_symbols(client)
         
-        # Use original profit as reference
-        original_profit = route.profit_pct
-        min_prof = max(0.01, original_profit * 0.5)
+        # For revalidation, do not enforce a minimum profit tied to the
+        # original route's profit. Allow any reasonable profit within a
+        # wide fixed range; _try_triangle_pattern itself already filters
+        # out extreme values beyond (-50, 50).
+        min_prof = -50.0
         max_prof = 50.0
         
         # Re-run triangle check
