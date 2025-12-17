@@ -114,6 +114,7 @@ ADMIN_TELEGRAM_ID = os.getenv("ADMIN_TELEGRAM_ID", "")
 TRADING_ENABLED = os.getenv("TRADING_ENABLED", "False").lower() == "true"
 MAX_ASSETS = int(os.getenv("MAX_ASSETS", "30"))  # Optimized for cross-pair coverage
 USE_MID_PRICES = os.getenv("USE_MID_PRICES", "false").lower() in ("1", "true", "yes")
+EXEC_SAFETY_FACTOR = float(os.getenv("EXEC_SAFETY_FACTOR", 0.98))
 
 # Celery Beat schedule
 from celery.schedules import schedule

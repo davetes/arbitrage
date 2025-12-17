@@ -59,6 +59,11 @@ def execute_cycle(route: CandidateRoute, notional_usd: float) -> Tuple[float, Li
     client = _client_auth()
     symbols = _load_symbols(client)
 
+    # Safety factor to avoid hitting exact balance limits on subsequent legs.
+    # For example, 0.98 means we always use 98% of the theoretical amount
+    # when placing orders, leaving a small buffer for fees and rounding.
+    safety_factor = getattr(S, "EXEC_SAFETY_FACTOR", 0.98)
+
     orders: List[Dict[str, Any]] = []
     current_asset = S.BASE_ASSET.upper()
     current_amount = notional_usd
@@ -76,10 +81,11 @@ def execute_cycle(route: CandidateRoute, notional_usd: float) -> Tuple[float, Li
             # Spend quote to receive base
             if current_asset != quote:
                 raise RuntimeError(f"Asset mismatch for leg {leg}. Have {current_asset}, need {quote}")
-            if current_amount < min_notional:
-                raise RuntimeError(f"Amount {current_amount} below min notional {min_notional} for {symbol}")
+            effective_amount = current_amount * safety_factor
+            if effective_amount < min_notional:
+                raise RuntimeError(f"Amount {effective_amount} below min notional {min_notional} for {symbol}")
             # Round quoteOrderQty to 8 decimal places to avoid precision errors
-            rounded_quote_qty = round(current_amount, 8)
+            rounded_quote_qty = round(effective_amount, 8)
             order = client.new_order(symbol=symbol, side="BUY", type="MARKET", quoteOrderQty=rounded_quote_qty)
             qty_out = sum(float(f["qty"]) for f in order.get("fills", [])) if order.get("fills") else float(order.get("executedQty", 0))
             current_asset = base
@@ -88,7 +94,7 @@ def execute_cycle(route: CandidateRoute, notional_usd: float) -> Tuple[float, Li
             # Sell base to receive quote
             if current_asset != base:
                 raise RuntimeError(f"Asset mismatch for leg {leg}. Have {current_asset}, need {base}")
-            sell_qty = _round_step(current_amount, step_size)
+            sell_qty = _round_step(current_amount * safety_factor, step_size)
             if sell_qty <= 0:
                 raise RuntimeError(f"Sell quantity too small for {symbol}")
             order = client.new_order(symbol=symbol, side="SELL", type="MARKET", quantity=sell_qty)
