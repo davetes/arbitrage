@@ -450,6 +450,26 @@ def _try_triangle_pattern(
         # No local depth_cache provided; fall back directly to snapshot helper
         return _depth_snapshot(client, symbol, use_cache=True)
     
+    # Optional mode: use mid-prices (ignore bid/ask spread) instead of
+    # separate bid and ask. Controlled via settings.USE_MID_PRICES.
+    use_mid_prices = getattr(S, "USE_MID_PRICES", False)
+    
+    def apply_mid_price(depth: Optional[dict]) -> Optional[dict]:
+        """If enabled, collapse bid/ask to their midpoint for pricing only."""
+        if not depth or not use_mid_prices:
+            return depth
+        try:
+            ask = float(depth.get("ask_price", 0))
+            bid = float(depth.get("bid_price", 0))
+            if ask <= 0 or bid <= 0:
+                return depth
+            mid = (ask + bid) / 2.0
+            depth["ask_price"] = mid
+            depth["bid_price"] = mid
+            return depth
+        except Exception:
+            return depth
+    
     # Validate inputs
     if major not in MAJOR_COINS:
         return None
@@ -490,9 +510,9 @@ def _try_triangle_pattern(
     
     # Try Pattern 1: MAJOR/BASE -> ALT/MAJOR -> ALT/BASE
     if pattern1_valid:
-        d1 = get_depth(pattern1_symbols[0])  # MAJOR/BASE
-        d2 = get_depth(pattern1_symbols[1])  # ALT/MAJOR or MAJOR/ALT
-        d3 = get_depth(pattern1_symbols[2])  # ALT/BASE
+        d1 = apply_mid_price(get_depth(pattern1_symbols[0]))  # MAJOR/BASE
+        d2 = apply_mid_price(get_depth(pattern1_symbols[1]))  # ALT/MAJOR or MAJOR/ALT
+        d3 = apply_mid_price(get_depth(pattern1_symbols[2]))  # ALT/BASE
         
         if d1 and d2 and d3:
             # Check if we have ALT/MAJOR or MAJOR/ALT
@@ -538,9 +558,9 @@ def _try_triangle_pattern(
     
     # Try Pattern 2: ALT/BASE -> ALT/MAJOR -> MAJOR/BASE
     if pattern2_valid:
-        d1 = get_depth(pattern2_symbols[0])  # ALT/BASE
-        d2 = get_depth(pattern2_symbols[1])  # ALT/MAJOR or MAJOR/ALT
-        d3 = get_depth(pattern2_symbols[2])  # MAJOR/BASE
+        d1 = apply_mid_price(get_depth(pattern2_symbols[0]))  # ALT/BASE
+        d2 = apply_mid_price(get_depth(pattern2_symbols[1]))  # ALT/MAJOR or MAJOR/ALT
+        d3 = apply_mid_price(get_depth(pattern2_symbols[2]))  # MAJOR/BASE
         
         if d1 and d2 and d3:
             # Check if we have ALT/MAJOR or MAJOR/ALT

@@ -113,6 +113,7 @@ ADMIN_TELEGRAM_ID = os.getenv("ADMIN_TELEGRAM_ID", "")
 # Safety flag: require explicit opt-in for live trading
 TRADING_ENABLED = os.getenv("TRADING_ENABLED", "False").lower() == "true"
 MAX_ASSETS = int(os.getenv("MAX_ASSETS", "30"))  # Optimized for cross-pair coverage
+USE_MID_PRICES = os.getenv("USE_MID_PRICES", "false").lower() in ("1", "true", "yes")
 
 # Celery Beat schedule
 from celery.schedules import schedule
