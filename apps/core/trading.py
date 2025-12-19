@@ -94,9 +94,19 @@ def execute_cycle(route: CandidateRoute, notional_usd: float) -> Tuple[float, Li
             # Sell base to receive quote
             if current_asset != base:
                 raise RuntimeError(f"Asset mismatch for leg {leg}. Have {current_asset}, need {base}")
-            sell_qty = _round_step(current_amount * safety_factor, step_size)
+            
+            # Check actual balance (fees reduce available amount)
+            actual_balance = get_account_balance(base).get(base, 0.0)
+            available_qty = min(current_amount, actual_balance)
+            
+            # Apply safety factor to available quantity
+            sell_qty = _round_step(available_qty * safety_factor, step_size)
             if sell_qty <= 0:
-                raise RuntimeError(f"Sell quantity too small for {symbol}")
+                # Try with less safety factor
+                sell_qty = _round_step(available_qty * 0.99, step_size)
+            if sell_qty <= 0:
+                raise RuntimeError(f"Insufficient balance: have {actual_balance}, need {current_amount}, step_size={step_size}")
+            
             order = client.new_order(symbol=symbol, side="SELL", type="MARKET", quantity=sell_qty)
             quote_got = float(order.get("cummulativeQuoteQty", 0))
             current_asset = quote
