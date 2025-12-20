@@ -107,7 +107,8 @@ def _wait_for_filled(client: BinanceClient, symbol: str, order_id: int) -> dict:
 
 
 def _filled_base_qty(order: dict) -> float:
-    # Market BUY: executedQty is base qty
+    """Base-asset quantity filled (executedQty or sum of fills qty)."""
+
     if "executedQty" in order:
         try:
             return float(order.get("executedQty") or 0)
@@ -119,6 +120,33 @@ def _filled_base_qty(order: dict) -> float:
         return float(sum(Decimal(str(f.get("qty", 0))) for f in fills))
 
     return 0.0
+
+
+def _filled_quote_qty(order: dict) -> float:
+    """Quote-asset amount filled (cummulativeQuoteQty or derived from fills)."""
+
+    if "cummulativeQuoteQty" in order:
+        try:
+            return float(order.get("cummulativeQuoteQty") or 0)
+        except Exception:
+            pass
+
+    fills = order.get("fills") or []
+    if fills:
+        total = Decimal("0")
+        for f in fills:
+            qty = Decimal(str(f.get("qty", 0)))
+            price = Decimal(str(f.get("price", 0)))
+            total += qty * price
+        return float(total)
+
+    # last resort: executedQty * avgPrice
+    try:
+        executed = Decimal(str(order.get("executedQty", 0) or 0))
+        avg_price = Decimal(str(order.get("avgPrice", 0) or 0))
+        return float(executed * avg_price)
+    except Exception:
+        return 0.0
 
 
 def execute_cycle(route: CandidateRoute, notional_usd: float) -> Tuple[float, List[Dict[str, Any]]]:
@@ -209,7 +237,7 @@ def execute_cycle(route: CandidateRoute, notional_usd: float) -> Tuple[float, Li
             order_id = int(order.get("orderId"))
             order = _wait_for_filled(client, symbol=symbol, order_id=order_id)
 
-            quote_got = Decimal(str(order.get("cummulativeQuoteQty", 0) or 0))
+            quote_got = Decimal(str(_filled_quote_qty(order)))
             current_asset = quote
             current_amount = quote_got
 
