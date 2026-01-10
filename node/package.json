@@ -1,0 +1,30 @@
+{
+  "name": "arbbot-node",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "node --watch src/server.js",
+    "start": "node src/server.js",
+    "worker": "node src/worker.js",
+    "bot": "node src/bot.js",
+    "migrate": "node src/db/migrate.js",
+    "lint": "node -c src/server.js"
+  },
+  "dependencies": {
+    "axios": "^1.6.8",
+    "bullmq": "^5.12.3",
+    "dotenv": "^16.4.5",
+    "express": "^4.19.2",
+    "helmet": "^7.1.0",
+    "ioredis": "^5.4.1",
+    "morgan": "^1.10.0",
+    "pino": "^9.0.0",
+    "pino-http": "^10.3.0",
+    "pg": "^8.11.5",
+    "sequelize": "^6.37.3",
+    "telegraf": "^4.16.3",
+    "zod": "^3.23.8",
+    "decimal.js": "^10.4.3"
+  }
+}
