@@ -34,7 +34,7 @@
 - **Details:** 
   - Sends structured messages with route, profit, volume
   - Includes "Check Validity" and "Execute Trade" buttons
-  - Bilingual support (English/Russian)
+  - English UI strings
 
 ### 6. .env Configuration System
 - **Status:** ✅ **IMPLEMENTED**
@@ -71,10 +71,10 @@
   - Respects `MAX_NOTIONAL_USD` and route volume
   - Adjusts dynamically
 
-### 11. Bilingual Support (English/Russian)
+### 11. Language Support
 - **Status:** ✅ **IMPLEMENTED**
 - **Location:** `apps/telegram_bot/bot.py` - `t()` function
-- **Details:** All messages and buttons translated
+- **Details:** English UI strings
 
 ### 12. Interactive Settings Menu (/config)
 - **Status:** ✅ **IMPLEMENTED**
@@ -83,7 +83,7 @@
   - Adjust profit thresholds
   - Adjust notional limits
   - Toggle scanning
-  - Change language
+  - View language
 
 ### 13. Performance Optimizations
 - **Status:** ✅ **IMPLEMENTED**

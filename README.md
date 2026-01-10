@@ -29,4 +29,4 @@ Buttons in Telegram:
 - Check Validity — re-quotes prices and depth
 - Execute Trade — manual-confirm full cycle after revalidation
 
-English now; i18n hooks prepared for Russian later.
+English UI strings.
