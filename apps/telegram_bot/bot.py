@@ -38,58 +38,6 @@ def t(key: str, lang: str = None) -> str:
                 lang = S.BOT_LANGUAGE
         except Exception:
             lang = S.BOT_LANGUAGE
-    ru = {
-        "ready": "Бот готов. Используйте кнопки, чтобы управлять сканированием.",
-        "config": "Настройки бота",
-        "config_menu": "⚙️ Настройки бота\n\nВыберите параметр для изменения:",
-        "tri": "Здесь вы будете получать маршруты треугольного арбитража.",
-        "direct": "Прямой арбитраж пока не реализован.",
-        "history": "История сделок будет доступна позже.",
-        "toggle": "Поиск переключен",
-        "route_missing": "Маршрут больше не существует",
-        "not_valid": "Маршрут сейчас невалиден",
-        "revalidated": "Маршрут обновлён",
-        "trade_disabled": "Трейдинг выключен (TRADING_ENABLED=false)",
-        "exec_started": "Исполнение ожидает подтверждения",
-        "exec_done": "Цикл выполнен",
-        "exec_failed": "Ошибка исполнения",
-        "confirm_title": "Подтвердите исполнение:",
-        "confirm_btn": "Подтвердить",
-        "cancel_btn": "Отмена",
-        "cancelled": "Отменено",
-        "start_search": "Запустить поиск",
-        "stop_search": "Остановить поиск",
-        "check": "Проверить актуальность",
-        "exec": "Исполнить сделку",
-        "settings_saved": "Настройки сохранены",
-        "min_profit": "Мин. прибыль",
-        "max_profit": "Макс. прибыль",
-        "min_notional": "Мин. сумма",
-        "max_notional": "Макс. сумма",
-        "back": "Назад",
-        "current_value": "Текущее значение",
-        "enter_new_value": "Введите новое значение",
-        "language": "Язык",
-        "scanning": "Сканирование",
-        "base_asset": "Базовый актив",
-        "select_language": "Выберите язык:",
-        "select_preset": "Выберите значение:",
-        "enabled": "Включено",
-        "disabled": "Выключено",
-        "toggle_scanning": "Переключить сканирование",
-        "use_entire_balance": "Использовать весь баланс",
-        "entire_balance": "Весь баланс",
-        "fixed_amount": "Фиксированная сумма",
-        "scan_started": "Сканирование запущено",
-        "scan_summary": "Сводка сканирования",
-        "symbols_loaded": "Символов загружено",
-        "depths_fetched": "Глубин получено",
-        "triangles_checked": "Треугольников проверено",
-        "routes_found": "Маршрутов найдено",
-        "routes_created": "Маршрутов создано",
-        "no_routes_found": "Прибыльных маршрутов не найдено",
-        "routes_saved": "маршрут(ов) сохранено в базу данных",
-    }
     en = {
         "ready": "Arbitrage bot ready. Use buttons to control scanning.",
         "config": "Bot Settings",
@@ -142,7 +90,7 @@ def t(key: str, lang: str = None) -> str:
         "no_routes_found": "No profitable routes found in this scan",
         "routes_saved": "route(s) saved to database",
     }
-    return ru.get(key) if lang and lang.lower().startswith("ru") else en.get(key)
+    return en.get(key)
 
 
 async def kb_global():
@@ -216,7 +164,6 @@ def kb_language_presets(current_lang: str, lang: str = None):
     """Create language selection buttons"""
     languages = [
         ("en", "English", "🇬🇧"),
-        ("ru", "Русский", "🇷🇺"),
     ]
     buttons = []
     for code, name, flag in languages:
@@ -284,7 +231,7 @@ async def main():
             cfg.bot_language = S.BOT_LANGUAGE
             await sync_to_async(cfg.save)()
         lang = cfg.bot_language
-        lang_display = "🇷🇺 Русский" if lang == "ru" else "🇬🇧 English"
+        lang_display = "🇬🇧 English"
         scanning_status = f"✅ {t('enabled', lang)}" if cfg.scanning_enabled else f"❌ {t('disabled', lang)}"
         balance_mode_status = f"✅ {t('enabled', lang)}" if cfg.use_entire_balance else f"❌ {t('disabled', lang)}"
         text = (
@@ -513,7 +460,7 @@ async def main():
             cfg.bot_language = S.BOT_LANGUAGE
             await sync_to_async(cfg.save)()
         lang = cfg.bot_language
-        lang_display = "🇷🇺 Русский" if lang == "ru" else "🇬🇧 English"
+        lang_display = "🇬🇧 English"
         scanning_status = f"✅ {t('enabled', lang)}" if cfg.scanning_enabled else f"❌ {t('disabled', lang)}"
         balance_mode_status = f"✅ {t('enabled', lang)}" if cfg.use_entire_balance else f"❌ {t('disabled', lang)}"
         text = (
@@ -549,7 +496,7 @@ async def main():
             await cb.answer(f"{t('scanning', lang)} {scanning_status_text}")
             
             # Return to config menu
-            lang_display = "🇷🇺 Русский" if lang == "ru" else "🇬🇧 English"
+            lang_display = "🇬🇧 English"
             scanning_status = f"✅ {t('enabled', lang)}" if cfg.scanning_enabled else f"❌ {t('disabled', lang)}"
             balance_mode_status = f"✅ {t('enabled', lang)}" if cfg.use_entire_balance else f"❌ {t('disabled', lang)}"
             text = (
@@ -573,7 +520,7 @@ async def main():
             await cb.answer(f"{t('use_entire_balance', lang)} {balance_status_text}")
             
             # Return to config menu
-            lang_display = "🇷🇺 Русский" if lang == "ru" else "🇬🇧 English"
+            lang_display = "🇬🇧 English"
             scanning_status = f"✅ {t('enabled', lang)}" if cfg.scanning_enabled else f"❌ {t('disabled', lang)}"
             balance_mode_status = f"✅ {t('enabled', lang)}" if cfg.use_entire_balance else f"❌ {t('disabled', lang)}"
             text = (
@@ -592,7 +539,7 @@ async def main():
         
         if setting == "language":
             current_lang = cfg.bot_language or S.BOT_LANGUAGE
-            lang_display = "🇷🇺 Русский" if current_lang == "ru" else "🇬🇧 English"
+            lang_display = "🇬🇧 English"
             text = (
                 f"🌐 {t('language', lang)}\n\n"
                 f"{t('current_value', lang)}: {lang_display}\n\n"
@@ -641,13 +588,13 @@ async def main():
         
         # Handle language setting (string, not float)
         if setting == "language":
-            if new_value_str not in ["en", "ru"]:
+            if new_value_str not in ["en"]:
                 await cb.answer("Invalid language", show_alert=True)
                 return
             cfg.bot_language = new_value_str
             await sync_to_async(cfg.save)()
             lang = new_value_str  # Update lang for response
-            lang_display = "🇷🇺 Русский" if new_value_str == "ru" else "🇬🇧 English"
+            lang_display = "🇬🇧 English"
             await cb.answer(f"{t('settings_saved', lang)}: {lang_display}")
         else:
             # Handle numeric settings
@@ -674,7 +621,7 @@ async def main():
             await cb.answer(f"{t('settings_saved', lang)}: {new_value}{unit}")
         
         # Return to config menu with updated language
-        lang_display = "🇷🇺 Русский" if lang == "ru" else "🇬🇧 English"
+        lang_display = "🇬🇧 English"
         scanning_status = f"✅ {t('enabled', lang)}" if cfg.scanning_enabled else f"❌ {t('disabled', lang)}"
         balance_mode_status = f"✅ {t('enabled', lang)}" if cfg.use_entire_balance else f"❌ {t('disabled', lang)}"
         text = (

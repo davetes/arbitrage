@@ -25,16 +25,11 @@ def _t(key: str, lang: str = None) -> str:
                 lang = S.BOT_LANGUAGE
         except Exception:
             lang = S.BOT_LANGUAGE
-    
-    ru = {
-        "check": "Проверить актуальность",
-        "exec": "Исполнить сделку",
-    }
     en = {
         "check": "Check Validity",
         "exec": "Execute Trade",
     }
-    return ru.get(key) if lang and lang.lower().startswith("ru") else en.get(key)
+    return en.get(key)
 
 
 @shared_task
@@ -124,16 +119,6 @@ def scan_triangular_routes():
             if created > 0 and S.TELEGRAM_BOT_TOKEN and S.ADMIN_TELEGRAM_ID:
                 # Get translations
                 def _get_translation(key: str) -> str:
-                    ru_translations = {
-                        "scan_summary": "📊 Сводка сканирования",
-                        "symbols_loaded": "📈 Символов загружено",
-                        "depths_fetched": "🔍 Глубин получено",
-                        "triangles_checked": "🔺 Треугольников проверено",
-                        "routes_found": "✅ Маршрутов найдено",
-                        "routes_created": "💾 Маршрутов создано",
-                        "no_routes_found": "⚠️ Прибыльных маршрутов не найдено в этом сканировании.",
-                        "routes_saved": "🎉 {count} маршрут(ов) сохранено в базу данных!",
-                    }
                     en_translations = {
                         "scan_summary": "📊 Scan Summary",
                         "symbols_loaded": "📈 Symbols loaded",
@@ -144,8 +129,7 @@ def scan_triangular_routes():
                         "no_routes_found": "⚠️ No profitable routes found in this scan.",
                         "routes_saved": "🎉 {count} route(s) saved to database!",
                     }
-                    translations = ru_translations if lang and lang.lower().startswith("ru") else en_translations
-                    return translations.get(key, key)
+                    return en_translations.get(key, key)
                 
                 summary_text = (
                     f"{_get_translation('scan_summary')}\n\n"
