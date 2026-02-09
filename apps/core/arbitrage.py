@@ -1,15 +1,22 @@
+"""
+Triangular Arbitrage Detection Module
+Features:
+- WebSocket real-time book ticker for fast price updates
+- Fee-adjusted profit calculation
+- Real volume calculation from order book depth
+- Thread-safe parallel execution
+"""
 from dataclasses import dataclass
 from typing import List, Optional, Dict, Tuple
 from binance.spot import Spot as BinanceClient
 try:
-    from binance.websocket.websocket_client import BinanceWebsocketClient
-except Exception:  # Dependency may be missing in some deployments
-    BinanceWebsocketClient = None
+    from binance.websocket.spot.websocket_stream import SpotWebsocketStreamClient
+except ImportError:
+    SpotWebsocketStreamClient = None
 from arbbot import settings as S
 from .symbol_loader import get_symbol_loader
 import time
 import logging
-import random
 import threading
 import json
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -17,105 +24,82 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 logger = logging.getLogger(__name__)
 
 # Only these coins are allowed as bridge (middle-leg) assets
-# Patterns:
-#   1) MAJOR/USDT -> X/MAJOR -> X/USDT  (Example: BTC/USDT -> RAD/BTC -> RAD/USDT)
-#   2) X/USDT -> MAJOR/X -> MAJOR/USDT  (Example: RUNE/USDT -> RUNE/BNB -> BNB/USDT)
 MAJOR_COINS = {"BTC", "ETH", "BNB"}
 
 
 class DepthCache:
-    """Cache for order book depth snapshots with TTL"""
-    def __init__(self, ttl_seconds: float = 2.0):
+    """Thread-safe cache for order book depth snapshots with TTL"""
+    def __init__(self, ttl_seconds: float = 10.0):
         self.ttl = ttl_seconds
         self._cache: Dict[str, Tuple[dict, float]] = {}
+        self._lock = threading.Lock()
     
     def get(self, symbol: str) -> Optional[dict]:
         """Get cached depth if still valid"""
-        if symbol in self._cache:
-            data, timestamp = self._cache[symbol]
-            if time.time() - timestamp < self.ttl:
-                return data
-            else:
-                del self._cache[symbol]
+        with self._lock:
+            if symbol in self._cache:
+                data, timestamp = self._cache[symbol]
+                if time.time() - timestamp < self.ttl:
+                    return data
+                else:
+                    del self._cache[symbol]
         return None
     
     def set(self, symbol: str, data: dict):
         """Cache depth data"""
-        self._cache[symbol] = (data, time.time())
+        with self._lock:
+            self._cache[symbol] = (data, time.time())
     
     def clear(self):
         """Clear all cached data"""
-        self._cache.clear()
+        with self._lock:
+            self._cache.clear()
 
 
-# Global depth cache instance (longer TTL to reduce API calls)
-_depth_cache = DepthCache(ttl_seconds=10.0)  # Increased from 2s to 10s
+# Global depth cache instance
+_depth_cache = DepthCache(ttl_seconds=10.0)
 
 
-class _BookTickerStream:
+class BookTickerStream:
     """
-    WebSocket-based best bid/ask cache using BinanceWebsocketClient (binance-connector 3.6.0).
-    Implements combined streams following official Binance WebSocket API.
-    Based on: https://binance-docs.github.io/apidocs/spot/en/#websocket-market-streams
+    WebSocket-based best bid/ask cache for real-time price updates.
+    Uses Binance's bookTicker stream for fastest price data.
     """
-
+    
     def __init__(self, ttl_seconds: float = 5.0):
         self.ttl = ttl_seconds
-        self.client: Optional[BinanceWebsocketClient] = None
-        self.lock = threading.Lock()
-        self.cache: Dict[str, Tuple[dict, float]] = {}
-        self.running = False
-        self.subscribed_symbols: set = set()
-        self.last_reconnect_time = 0.0
-        self.reconnect_interval = 82800.0  # Reconnect before 24 hour limit (23 hours)
-        self._base_url = "wss://stream.binance.com:9443"  # Official base endpoint
-
-    def _on_message(self, _, message: str):
-        """
-        Handle WebSocket messages according to Binance API:
-        - Combined stream format: {"stream": "btcusdt@bookTicker", "data": {...}}
-        - Single stream format: {"s": "BTCUSDT", "b": "...", ...}
-        - Control messages: {"result": ..., "id": ...}
-        """
+        self._cache: Dict[str, Tuple[dict, float]] = {}
+        self._lock = threading.Lock()
+        self._client = None
+        self._running = False
+        self._subscribed_symbols: set = set()
+        self._last_connect_time = 0.0
+    
+    def _on_message(self, _, message):
+        """Handle WebSocket messages"""
         try:
-            data = json.loads(message)
-            if not isinstance(data, dict):
-                return
+            if isinstance(message, str):
+                data = json.loads(message)
+            else:
+                data = message
             
-            # Handle control messages (subscribe/unsubscribe responses)
-            if "result" in data and "id" in data:
-                # This is a control message response, ignore
+            if not isinstance(data, dict):
                 return
             
             # Handle combined stream format: {"stream": "btcusdt@bookTicker", "data": {...}}
             if "stream" in data and "data" in data:
-                stream_name = data.get("stream", "")
-                if "@bookTicker" in stream_name:
-                    ticker_data = data["data"]
-                    symbol = ticker_data.get("s") or ticker_data.get("symbol")
-                    self._process_book_ticker(symbol, ticker_data)
+                ticker_data = data["data"]
+            elif "s" in data:
+                # Direct stream format
+                ticker_data = data
+            else:
                 return
             
-            # Handle single stream format (raw stream)
-            # Check if it's a bookTicker message
-            if "s" in data and ("b" in data or "a" in data):
-                symbol = data.get("s") or data.get("symbol")
-                self._process_book_ticker(symbol, data)
+            symbol = ticker_data.get("s", "").upper()
+            if not symbol:
                 return
-                
-        except Exception as e:
-            logger.debug(f"Error processing WebSocket message: {e}")
-            return
-    
-    def _process_book_ticker(self, symbol: str, ticker_data: dict):
-        """Process bookTicker data according to Binance API format"""
-        if not symbol:
-            return
-        
-        # Binance bookTicker format:
-        # {"u":400900217, "s":"BNBUSDT", "b":"25.35190000", "B":"31.21000000", 
-        #  "a":"25.36520000", "A":"40.66000000"}
-        try:
+            
+            # Parse bookTicker data
             bid_price = float(ticker_data.get("b", 0))
             bid_qty = float(ticker_data.get("B", 0))
             ask_price = float(ticker_data.get("a", 0))
@@ -123,7 +107,7 @@ class _BookTickerStream:
             
             if bid_price <= 0 or ask_price <= 0:
                 return
-                
+            
             snapshot = {
                 "ask_price": ask_price,
                 "ask_qty": ask_qty,
@@ -133,154 +117,109 @@ class _BookTickerStream:
                 "total_bid_qty": bid_qty,
                 "cap_ask_quote": ask_price * ask_qty,
                 "cap_bid_quote": bid_price * bid_qty,
+                "source": "websocket"
             }
-            with self.lock:
-                self.cache[symbol.upper()] = (snapshot, time.time())
-        except (ValueError, TypeError) as e:
-            logger.debug(f"Error parsing bookTicker data for {symbol}: {e}")
-            return
-
-    def _ensure_connection(self, symbols: List[str], **kwargs):
-        """
-        Ensure WebSocket connection is active and subscribed to required symbols.
-        Uses BinanceWebsocketClient which starts automatically upon instantiation.
-        """
-        if BinanceWebsocketClient is None:
-            logger.warning("BinanceWebsocketClient unavailable; skipping websocket bookTicker startup.")
+            
+            with self._lock:
+                self._cache[symbol] = (snapshot, time.time())
+                
+        except Exception as e:
+            logger.debug(f"WebSocket message error: {e}")
+    
+    def start(self, symbols: List[str]):
+        """Start WebSocket connection for given symbols"""
+        if SpotWebsocketStreamClient is None:
+            logger.warning("WebSocket client not available - using REST API only")
             return False
         
         symbols_set = {s.upper() for s in symbols}
-        needs_update = not self.running or symbols_set != self.subscribed_symbols
         
-        # Check if reconnection is needed (prevent stale connections)
-        now = time.time()
-        needs_reconnect = (now - self.last_reconnect_time) > self.reconnect_interval
-        
-        if needs_reconnect and self.running:
-            logger.info("Reconnecting WebSocket to prevent stale connection...")
-            self.stop()
-            needs_update = True
-        
-        if not needs_update:
+        # Check if we need to reconnect
+        if self._running and symbols_set == self._subscribed_symbols:
             return True
         
         try:
-            # Stop existing connection if running
-            if self.running:
-                self.stop()
-                time.sleep(0.2)  # Brief pause for cleanup
+            # Stop existing connection
+            self.stop()
             
-            # Use combined stream format for efficiency (up to 1024 streams per connection per Binance API)
-            # Binance format: wss://stream.binance.com:9443/stream?streams=btcusdt@bookTicker/ethusdt@bookTicker/...
-            stream_symbols = [s.lower() for s in symbols]
+            # Create new connection
+            self._client = SpotWebsocketStreamClient(
+                on_message=self._on_message,
+                is_combined=True
+            )
             
-            # Binance allows up to 1024 streams per combined stream (per official API)
-            max_streams_per_connection = 1024
-            if len(stream_symbols) <= max_streams_per_connection:
-                # Single connection for all symbols using combined stream
-                streams = "/".join([f"{sym}@bookTicker" for sym in stream_symbols])
-                # Use combined stream endpoint
-                combined_url = f"{self._base_url}/stream?streams={streams}"
-                
-                # BinanceWebsocketClient starts automatically upon instantiation
-                # on_message must be first parameter, stream_url second
-                self.client = BinanceWebsocketClient(
-                    on_message=self._on_message,
-                    stream_url=combined_url,
-                    **kwargs
-                )
-                # No need to call start() - client starts automatically
-                
-                self.subscribed_symbols = symbols_set
-                self.running = True
-                self.last_reconnect_time = now
-                logger.info(f"WebSocket connected: {len(stream_symbols)} symbols via combined stream (max 1024)")
-            else:
-                # Multiple connections for large symbol sets - use first 1024 (highest priority)
-                logger.info(f"Large symbol set ({len(stream_symbols)}), using top {max_streams_per_connection} symbols")
-                limited_symbols = stream_symbols[:max_streams_per_connection]
-                streams = "/".join([f"{sym}@bookTicker" for sym in limited_symbols])
-                combined_url = f"{self._base_url}/stream?streams={streams}"
-                
-                # BinanceWebsocketClient starts automatically upon instantiation
-                # on_message must be first parameter, stream_url second
-                self.client = BinanceWebsocketClient(
-                    on_message=self._on_message,
-                    stream_url=combined_url,
-                    **kwargs
-                )
-                # No need to call start() - client starts automatically
-                
-                self.subscribed_symbols = {s.upper() for s in limited_symbols}
-                self.running = True
-                self.last_reconnect_time = now
-                logger.info(f"WebSocket connected: {len(limited_symbols)} symbols (limited to {max_streams_per_connection})")
+            # Subscribe to bookTicker streams (up to 200 symbols)
+            limited_symbols = list(symbols_set)[:200]
+            for symbol in limited_symbols:
+                self._client.book_ticker(symbol=symbol.lower())
             
+            self._subscribed_symbols = set(s.upper() for s in limited_symbols)
+            self._running = True
+            self._last_connect_time = time.time()
+            
+            logger.info(f"WebSocket started: {len(limited_symbols)} symbols")
             return True
+            
         except Exception as e:
-            logger.error(f"Failed to start WebSocket: {e}", exc_info=True)
-            self.running = False
+            logger.error(f"Failed to start WebSocket: {e}")
+            self._running = False
             return False
-
-    def start(self, symbols: List[str], **kwargs):
-        """Start or update bookTicker websocket subscriptions (keeps connection alive)."""
-        if not symbols:
-            return
-        
-        self._ensure_connection(symbols, **kwargs)
-
+    
     def stop(self):
-        """Stop websocket connection"""
-        if self.client:
+        """Stop WebSocket connection"""
+        if self._client:
             try:
-                self.client.stop()
+                self._client.stop()
             except Exception:
                 pass
-        self.running = False
-        self.client = None
-
+        self._client = None
+        self._running = False
+    
     def get(self, symbol: str) -> Optional[dict]:
-        """Get cached ticker data if available and fresh"""
-        now = time.time()
-        with self.lock:
+        """Get cached ticker data if fresh"""
+        with self._lock:
             symbol_upper = symbol.upper()
-            if symbol_upper in self.cache:
-                data, ts = self.cache[symbol_upper]
-                if now - ts < self.ttl:
+            if symbol_upper in self._cache:
+                data, ts = self._cache[symbol_upper]
+                if time.time() - ts < self.ttl:
                     return data
                 else:
-                    # Data expired, remove from cache
-                    del self.cache[symbol_upper]
+                    del self._cache[symbol_upper]
         return None
     
-    def get_coverage(self, symbols: List[str]) -> Tuple[int, int]:
-        """Get WebSocket coverage stats"""
-        now = time.time()
-        with self.lock:
-            valid_count = 0
-            for sym in symbols:
-                sym_upper = sym.upper()
-                if sym_upper in self.cache:
-                    _, ts = self.cache[sym_upper]
-                    if now - ts < self.ttl:
-                        valid_count += 1
-            return valid_count, len(symbols)
+    def is_running(self) -> bool:
+        """Check if WebSocket is active"""
+        return self._running
+    
+    def get_stats(self) -> dict:
+        """Get WebSocket stats"""
+        with self._lock:
+            valid_count = sum(
+                1 for _, (_, ts) in self._cache.items()
+                if time.time() - ts < self.ttl
+            )
+            return {
+                "running": self._running,
+                "subscribed": len(self._subscribed_symbols),
+                "cached": valid_count,
+            }
 
 
-# Global WebSocket stream instance with persistent connection (created after class definition)
-_book_ticker_stream = _BookTickerStream(ttl_seconds=5.0)
-
+# Global WebSocket stream instance
+_book_ticker_stream = BookTickerStream(ttl_seconds=5.0)
 
 @dataclass
 class CandidateRoute:
     a: str  # leg1 label e.g., "BTC/USDT buy"
     b: str  # leg2 label e.g., "ETH/BTC buy"
     c: str  # leg3 label e.g., "ETH/USDT sell"
-    profit_pct: float
-    volume_usd: float
+    profit_pct: float  # Net profit after fees
+    volume_usd: float  # Calculated from order book depth
+    gross_profit_pct: float = 0.0  # Gross profit before fees
 
 
 def _client(timeout: int = None) -> BinanceClient:
+    """Create Binance client with configured settings"""
     if timeout is None:
         timeout = 30
     kwargs = {
@@ -296,99 +235,43 @@ def _client(timeout: int = None) -> BinanceClient:
 
 
 def _load_symbols(client: BinanceClient) -> Dict[str, dict]:
-    """Load all active spot markets with target quotes (USDT, BTC, ETH, BNB, FDUSD, USDC)."""
-    TARGET_QUOTES = {"USDT", "BTC", "ETH", "BNB", "FDUSD", "USDC"}
-    
-    try:
-        exchange_info = client.exchange_info()
-        symbols = {}
-        seen_symbols = set()
-        invalid_count = 0
-        filtered_count = 0
-        
-        for symbol_info in exchange_info.get("symbols", []):
-            symbol = symbol_info.get("symbol", "").strip()
-            if not symbol:
-                continue
-            
-            if symbol_info.get("status") != "TRADING":
-                continue
-            
-            base_asset = symbol_info.get("baseAsset", "").upper().strip()
-            quote_asset = symbol_info.get("quoteAsset", "").upper().strip()
-            
-            if not base_asset or not quote_asset or base_asset == quote_asset:
-                invalid_count += 1
-                continue
-            
-            if quote_asset not in TARGET_QUOTES:
-                filtered_count += 1
-                continue
-            
-            if symbol in seen_symbols:
-                continue
-            
-            seen_symbols.add(symbol)
-            
-            symbols[symbol] = {
-                "symbol": symbol,
-                "baseAsset": base_asset,
-                "quoteAsset": quote_asset,
-                "status": "TRADING"
-            }
-        
-        logger.info(
-            f"Loaded {len(symbols)} active spot markets with quotes {sorted(TARGET_QUOTES)} "
-            f"(filtered {filtered_count} non-target quotes, {invalid_count} invalid pairs)"
-        )
-        
-        # Log breakdown by quote
-        quote_counts = {}
-        for sym_info in symbols.values():
-            quote = sym_info.get("quoteAsset", "UNKNOWN")
-            quote_counts[quote] = quote_counts.get(quote, 0) + 1
-        
-        logger.info(f"Symbol breakdown by quote: {dict(sorted(quote_counts.items()))}")
-        
-        return symbols
-        
-    except Exception as e:
-        logger.error(f"Failed to load symbols: {e}", exc_info=True)
-        logger.info("Falling back to FastSymbolLoader")
-        loader = get_symbol_loader(cache_ttl_seconds=300)
-        return loader.load_symbols(
-            client, 
-            base_asset=S.BASE_ASSET, 
-            use_cache=True, 
-            include_all_pairs=False
-        )
+    """Load all active spot markets using FastSymbolLoader"""
+    loader = get_symbol_loader(cache_ttl_seconds=300)
+    return loader.load_symbols(
+        client, 
+        base_asset=S.BASE_ASSET, 
+        use_cache=True, 
+        include_all_pairs=False
+    )
 
 
-def _depth_snapshot(client: BinanceClient, symbol: str, depth: int = 20, use_cache: bool = True) -> Optional[dict]:
-    """Get depth snapshot with aggressive caching and rate limit protection."""
-    # Try websocket bookTicker cache first (even if disabled, may have old data)
+def _depth_snapshot(client: BinanceClient, symbol: str, depth: int = 5, use_cache: bool = True) -> Optional[dict]:
+    """Get depth snapshot - tries WebSocket cache first, then REST cache, then API"""
+    # 1. Try WebSocket cache first (fastest, real-time data)
     ws_data = _book_ticker_stream.get(symbol)
     if ws_data:
         return ws_data
-
+    
+    # 2. Try REST cache
     if use_cache:
         cached = _depth_cache.get(symbol)
         if cached is not None:
             return cached
     
-    # Rate limit protection: longer delays and fewer retries
-    backoff = 0.5  # Start with longer delay
-    for attempt in range(2):  # Reduce retries from 3 to 2
+    # Simple retry with backoff
+    for attempt in range(2):
         try:
-            d = client.depth(symbol, limit=5)  # Use smaller depth (5 instead of 20)
+            d = client.depth(symbol, limit=depth)
             if not d.get("asks") or not d.get("bids"):
                 return None
+            
             ask_p, ask_q = float(d["asks"][0][0]), float(d["asks"][0][1])
             bid_p, bid_q = float(d["bids"][0][0]), float(d["bids"][0][1])
             total_ask_qty = sum(float(q) for _, q in d["asks"])
             total_bid_qty = sum(float(q) for _, q in d["bids"])
             cap_ask_quote = sum(float(p) * float(q) for p, q in d["asks"])
             cap_bid_quote = sum(float(p) * float(q) for p, q in d["bids"])
+            
             result = {
                 "ask_price": ask_p,
                 "ask_qty": ask_q,
@@ -404,13 +287,44 @@ def _depth_snapshot(client: BinanceClient, symbol: str, depth: int = 20, use_cac
             return result
         except Exception as e:
             error_str = str(e).lower()
-            if "too much request weight" in error_str or "banned" in error_str or "429" in error_str:
-                logger.warning(f"Rate limit hit for {symbol}, waiting {backoff * 6:.1f}s...")
-                time.sleep(backoff * 6)  # Much longer wait for rate limits
+            if "too much request" in error_str or "429" in error_str:
+                logger.warning(f"Rate limit hit for {symbol}, waiting...")
+                time.sleep(2.0)
             else:
-                time.sleep(backoff)
-            backoff *= 3  # Increase backoff more aggressively
+                time.sleep(0.5)
     return None
+
+
+def _calculate_fee_pct() -> float:
+    """Calculate total fee percentage for 3 legs"""
+    fee_per_leg = (S.FEE_RATE_BPS + S.EXTRA_FEE_BPS) / 100.0  # BPS to percentage
+    return fee_per_leg * 3  # 3 legs
+
+
+def _calculate_volume_usd(depths: List[Optional[dict]], base_asset: str = "USDT") -> float:
+    """
+    Calculate executable volume from order book depth.
+    Returns minimum capacity across all legs in USD.
+    """
+    if not all(depths):
+        return 0.0
+    
+    capacities = []
+    for d in depths:
+        if d:
+            # Use the smaller of ask and bid capacity
+            ask_cap = d.get("cap_ask_quote", 0)
+            bid_cap = d.get("cap_bid_quote", 0)
+            capacities.append(min(ask_cap, bid_cap) if ask_cap and bid_cap else max(ask_cap, bid_cap))
+    
+    if not capacities:
+        return 0.0
+    
+    # Volume is limited by the smallest leg
+    min_volume = min(capacities)
+    
+    # Cap at MAX_NOTIONAL_USD
+    return min(min_volume, S.MAX_NOTIONAL_USD)
 
 
 def _try_triangle_pattern(
@@ -422,23 +336,18 @@ def _try_triangle_pattern(
     min_profit_pct: float,
     max_profit_pct: float,
     depth_cache: Dict[str, Optional[dict]] = None,
-    stats: dict = None
+    stats: dict = None,
+    stats_lock: threading.Lock = None
 ) -> Optional[CandidateRoute]:
     """
-    Check triangle patterns exactly as shown in screenshots:
+    Check triangle patterns with FEE-ADJUSTED profit calculation:
     Pattern 1: MAJOR/USDT -> ALT/MAJOR -> ALT/USDT  (Buy-Buy-Sell)
     Pattern 2: ALT/USDT -> ALT/MAJOR -> MAJOR/USDT  (Buy-Sell-Sell)
     
-    Returns route if profit is within target range.
+    Returns route if NET profit (after fees) is within target range.
     """
     def get_depth(symbol: str) -> Optional[dict]:
-        """Get depth for a symbol using optional local cache, then REST fallback.
-
-        - If depth_cache is provided and has the symbol, return cached depth.
-        - Otherwise, call _depth_snapshot (which has its own global cache and
-          rate limiting), and, if successful, store the result back into
-          depth_cache for reuse within the current scan.
-        """
+        """Get depth with local cache support"""
         if depth_cache is not None:
             cached = depth_cache.get(symbol)
             if cached is not None:
@@ -447,32 +356,24 @@ def _try_triangle_pattern(
             if depth:
                 depth_cache[symbol] = depth
             return depth
-        # No local depth_cache provided; fall back directly to snapshot helper
         return _depth_snapshot(client, symbol, use_cache=True)
     
-    # Optional mode: use mid-prices (ignore bid/ask spread) instead of
-    # separate bid and ask. Controlled via settings.USE_MID_PRICES.
-    use_mid_prices = getattr(S, "USE_MID_PRICES", False)
-    
-    def apply_mid_price(depth: Optional[dict]) -> Optional[dict]:
-        """If enabled, collapse bid/ask to their midpoint for pricing only."""
-        if not depth or not use_mid_prices:
-            return depth
-        try:
-            ask = float(depth.get("ask_price", 0))
-            bid = float(depth.get("bid_price", 0))
-            if ask <= 0 or bid <= 0:
-                return depth
-            mid = (ask + bid) / 2.0
-            depth["ask_price"] = mid
-            depth["bid_price"] = mid
-            return depth
-        except Exception:
-            return depth
+    def update_stats(key: str, increment: int = 1):
+        """Thread-safe stats update"""
+        if stats is None:
+            return
+        if stats_lock:
+            with stats_lock:
+                stats[key] = stats.get(key, 0) + increment
+        else:
+            stats[key] = stats.get(key, 0) + increment
     
     # Validate inputs
     if major not in MAJOR_COINS:
         return None
+    
+    # Calculate total fee for 3 legs
+    total_fee_pct = _calculate_fee_pct()
     
     # PATTERN 1: MAJOR/BASE -> ALT/MAJOR -> ALT/BASE
     pattern1_symbols = [
@@ -488,17 +389,16 @@ def _try_triangle_pattern(
         f"{major}{base}"     # MAJOR/BASE (e.g., BNB/USDT)
     ]
     
-    # Check if Pattern 1 symbols exist
+    # Check if symbols exist
     pattern1_valid = all(sym in symbols for sym in pattern1_symbols)
     pattern2_valid = all(sym in symbols for sym in pattern2_symbols)
     
+    # Check for inverted cross pair
     if not pattern1_valid and not pattern2_valid:
-        # Check for inverted cross pair (MAJOR/ALT instead of ALT/MAJOR)
         alt_major_inverted = f"{major}{alt}"
         if alt_major_inverted in symbols:
-            # We have MAJOR/ALT instead of ALT/MAJOR, but we can still try patterns
-            pattern1_symbols[1] = alt_major_inverted  # Use MAJOR/ALT for pattern 1
-            pattern2_symbols[1] = alt_major_inverted  # Use MAJOR/ALT for pattern 2
+            pattern1_symbols[1] = alt_major_inverted
+            pattern2_symbols[1] = alt_major_inverted
             pattern1_valid = all(sym in symbols for sym in pattern1_symbols)
             pattern2_valid = all(sym in symbols for sym in pattern2_symbols)
     
@@ -510,170 +410,137 @@ def _try_triangle_pattern(
     
     # Try Pattern 1: MAJOR/BASE -> ALT/MAJOR -> ALT/BASE
     if pattern1_valid:
-        d1 = apply_mid_price(get_depth(pattern1_symbols[0]))  # MAJOR/BASE
-        d2 = apply_mid_price(get_depth(pattern1_symbols[1]))  # ALT/MAJOR or MAJOR/ALT
-        d3 = apply_mid_price(get_depth(pattern1_symbols[2]))  # ALT/BASE
+        d1 = get_depth(pattern1_symbols[0])
+        d2 = get_depth(pattern1_symbols[1])
+        d3 = get_depth(pattern1_symbols[2])
         
         if d1 and d2 and d3:
-            # Check if we have ALT/MAJOR or MAJOR/ALT
             is_inverted = pattern1_symbols[1].startswith(major)
             
             if is_inverted:
-                # We have MAJOR/ALT, need to invert for calculation
-                # For Pattern 1 with MAJOR/ALT: Buy MAJOR/BASE -> Sell MAJOR/ALT -> Buy ALT/BASE? Wait, that's wrong.
-                # Actually, Pattern 1 needs: Buy MAJOR, Buy ALT with MAJOR
-                # If we have MAJOR/ALT, then selling MAJOR/ALT means buying ALT with MAJOR
-                # So: 1. Buy MAJOR with BASE, 2. Sell MAJOR for ALT, 3. Sell ALT for BASE
                 amount = 1.0
-                amount = amount / d1["ask_price"]        # Buy MAJOR with BASE
-                amount = amount * d2["bid_price"]        # Sell MAJOR for ALT (using MAJOR/ALT bid)
-                amount = amount * d3["bid_price"]        # Sell ALT for BASE
-                profit1 = (amount - 1.0) * 100.0
+                amount = amount / d1["ask_price"]
+                amount = amount * d2["bid_price"]
+                amount = amount * d3["bid_price"]
             else:
-                # Normal ALT/MAJOR pair
                 amount = 1.0
-                amount = amount / d1["ask_price"]        # Buy MAJOR with BASE
-                amount = amount / d2["ask_price"]        # Buy ALT with MAJOR
-                amount = amount * d3["bid_price"]        # Sell ALT for BASE
-                profit1 = (amount - 1.0) * 100.0
+                amount = amount / d1["ask_price"]
+                amount = amount / d2["ask_price"]
+                amount = amount * d3["bid_price"]
             
-            if -50 < profit1 < 50 and profit1 > best_profit:
-                best_profit = profit1
+            gross_profit = (amount - 1.0) * 100.0
+            net_profit = gross_profit - total_fee_pct  # APPLY FEES
+            
+            # Calculate real volume from order book
+            volume_usd = _calculate_volume_usd([d1, d2, d3], base)
+            
+            if -50 < net_profit < 50 and net_profit > best_profit and volume_usd >= S.MIN_NOTIONAL_USD:
+                best_profit = net_profit
                 if is_inverted:
                     best_route = CandidateRoute(
                         a=f"{major}/{base} buy",
-                        b=f"{major}/{alt} sell",  # Selling MAJOR/ALT means buying ALT with MAJOR
+                        b=f"{major}/{alt} sell",
                         c=f"{alt}/{base} sell",
-                        profit_pct=round(profit1, 4),
-                        volume_usd=round(S.MAX_NOTIONAL_USD, 2),
+                        profit_pct=round(net_profit, 4),
+                        gross_profit_pct=round(gross_profit, 4),
+                        volume_usd=round(volume_usd, 2),
                     )
                 else:
                     best_route = CandidateRoute(
                         a=f"{major}/{base} buy",
                         b=f"{alt}/{major} buy",
                         c=f"{alt}/{base} sell",
-                        profit_pct=round(profit1, 4),
-                        volume_usd=round(S.MAX_NOTIONAL_USD, 2),
+                        profit_pct=round(net_profit, 4),
+                        gross_profit_pct=round(gross_profit, 4),
+                        volume_usd=round(volume_usd, 2),
                     )
     
     # Try Pattern 2: ALT/BASE -> ALT/MAJOR -> MAJOR/BASE
     if pattern2_valid:
-        d1 = apply_mid_price(get_depth(pattern2_symbols[0]))  # ALT/BASE
-        d2 = apply_mid_price(get_depth(pattern2_symbols[1]))  # ALT/MAJOR or MAJOR/ALT
-        d3 = apply_mid_price(get_depth(pattern2_symbols[2]))  # MAJOR/BASE
+        d1 = get_depth(pattern2_symbols[0])
+        d2 = get_depth(pattern2_symbols[1])
+        d3 = get_depth(pattern2_symbols[2])
         
         if d1 and d2 and d3:
-            # Check if we have ALT/MAJOR or MAJOR/ALT
             is_inverted = pattern2_symbols[1].startswith(major)
             
             if is_inverted:
-                # We have MAJOR/ALT, need to invert for calculation
-                # For Pattern 2 with MAJOR/ALT: Buy ALT/BASE -> Buy MAJOR/ALT -> Sell MAJOR/BASE
                 amount = 1.0
-                amount = amount / d1["ask_price"]        # Buy ALT with BASE
-                amount = amount / d2["ask_price"]        # Buy MAJOR with ALT (using MAJOR/ALT ask)
-                amount = amount * d3["bid_price"]        # Sell MAJOR for BASE
-                profit2 = (amount - 1.0) * 100.0
+                amount = amount / d1["ask_price"]
+                amount = amount / d2["ask_price"]
+                amount = amount * d3["bid_price"]
             else:
-                # Normal ALT/MAJOR pair
                 amount = 1.0
-                amount = amount / d1["ask_price"]        # Buy ALT with BASE
-                amount = amount * d2["bid_price"]        # Sell ALT for MAJOR
-                amount = amount * d3["bid_price"]        # Sell MAJOR for BASE
-                profit2 = (amount - 1.0) * 100.0
+                amount = amount / d1["ask_price"]
+                amount = amount * d2["bid_price"]
+                amount = amount * d3["bid_price"]
             
-            if -50 < profit2 < 50 and profit2 > best_profit:
-                best_profit = profit2
+            gross_profit = (amount - 1.0) * 100.0
+            net_profit = gross_profit - total_fee_pct  # APPLY FEES
+            
+            # Calculate real volume from order book
+            volume_usd = _calculate_volume_usd([d1, d2, d3], base)
+            
+            if -50 < net_profit < 50 and net_profit > best_profit and volume_usd >= S.MIN_NOTIONAL_USD:
+                best_profit = net_profit
                 if is_inverted:
                     best_route = CandidateRoute(
                         a=f"{alt}/{base} buy",
-                        b=f"{major}/{alt} buy",  # Buying MAJOR/ALT means selling ALT for MAJOR
+                        b=f"{major}/{alt} buy",
                         c=f"{major}/{base} sell",
-                        profit_pct=round(profit2, 4),
-                        volume_usd=round(S.MAX_NOTIONAL_USD, 2),
+                        profit_pct=round(net_profit, 4),
+                        gross_profit_pct=round(gross_profit, 4),
+                        volume_usd=round(volume_usd, 2),
                     )
                 else:
                     best_route = CandidateRoute(
                         a=f"{alt}/{base} buy",
                         b=f"{alt}/{major} sell",
                         c=f"{major}/{base} sell",
-                        profit_pct=round(profit2, 4),
-                        volume_usd=round(S.MAX_NOTIONAL_USD, 2),
+                        profit_pct=round(net_profit, 4),
+                        gross_profit_pct=round(gross_profit, 4),
+                        volume_usd=round(volume_usd, 2),
                     )
     
     # Check if best profit is in target range
     if best_route and min_profit_pct <= best_route.profit_pct <= max_profit_pct:
-        if stats is not None:
-            stats["routes_found"] = stats.get("routes_found", 0) + 1
-        logger.info(f"FOUND: {best_route.a} → {best_route.b} → {best_route.c}, profit: {best_route.profit_pct}%")
+        update_stats("routes_found")
+        logger.info(
+            f"FOUND: {best_route.a} → {best_route.b} → {best_route.c}, "
+            f"net: {best_route.profit_pct}%, gross: {best_route.gross_profit_pct}%, "
+            f"volume: ${best_route.volume_usd}"
+        )
         return best_route
     elif best_route:
-        if stats is not None:
-            stats["filtered_profit"] = stats.get("filtered_profit", 0) + 1
+        update_stats("filtered_profit")
     
     return None
 
 
-def _try_random_triangle(
-    client: BinanceClient, 
-    symbols: Dict[str, dict], 
-    base: str, 
-    x: str, 
-    y: str,
-    min_profit_pct: float,
-    max_profit_pct: float,
-    depth_cache: Dict[str, Optional[dict]] = None,
-    stats: dict = None
-) -> Optional[CandidateRoute]:
-    """
-    Wrapper for backward compatibility - calls the new pattern-based function.
-    Determines which coin is major and which is alt, then calls _try_triangle_pattern.
-    """
-    # Determine which is major and which is alt
-    if x in MAJOR_COINS and y not in MAJOR_COINS:
-        # x is major, y is alt
-        return _try_triangle_pattern(
-            client, symbols, base, x, y, 
-            min_profit_pct, max_profit_pct, depth_cache, stats
-        )
-    elif y in MAJOR_COINS and x not in MAJOR_COINS:
-        # y is major, x is alt
-        return _try_triangle_pattern(
-            client, symbols, base, y, x, 
-            min_profit_pct, max_profit_pct, depth_cache, stats
-        )
-    else:
-        # Both are majors or both are alts - invalid for our patterns
-        if stats is not None:
-            stats["filtered_major_pattern"] = stats.get("filtered_major_pattern", 0) + 1
-        return None
-
-
-def find_random_routes(
+def find_candidate_routes(
     *, 
     min_profit_pct: float, 
     max_profit_pct: float,
     available_balance: float = None,
-    max_attempts: int = 2000,
     max_routes: int = 10,
     use_parallel: bool = True
 ) -> Tuple[List[CandidateRoute], dict]:
     """
-    Exhaustive exploration for triangular arbitrage opportunities.
-    Tries all valid (major, alt) combinations instead of random sampling.
+    Find triangular arbitrage opportunities with fee-adjusted profits.
+    
+    Returns:
+        Tuple of (list of CandidateRoute, stats dict)
     """
     start_time = time.time()
+    stats_lock = threading.Lock()
     
     stats = {
         "attempts": 0,
-        "random_checks": 0,
         "routes_found": 0,
         "filtered_profit": 0,
-        "filtered_missing_pairs": 0,
-        "filtered_major_pattern": 0,
         "unique_assets_tried": set(),
-        "unique_pairs_tried": set(),
         "start_time": start_time,
+        "fee_pct_applied": _calculate_fee_pct(),
     }
     
     try:
@@ -681,11 +548,11 @@ def find_random_routes(
         symbols = _load_symbols(client)
         base = S.BASE_ASSET.upper()
         
-        logger.info(f"=== EXHAUSTIVE EXPLORATION STARTED ===")
-        logger.info(f"Target profit: {min_profit_pct}% - {max_profit_pct}%")
-        logger.info(f"Max routes to return: {max_routes}")
+        logger.info(f"=== ROUTE SCAN STARTED ===")
+        logger.info(f"Target net profit: {min_profit_pct}% - {max_profit_pct}% (after {stats['fee_pct_applied']:.2f}% fees)")
+        logger.info(f"Min volume: ${S.MIN_NOTIONAL_USD}, Max: ${S.MAX_NOTIONAL_USD}")
         
-        # Get ALL assets that trade with BASE (typically USDT)
+        # Get assets that trade with BASE
         usdt_assets = []
         major_assets = []
         for sym, info in symbols.items():
@@ -699,62 +566,35 @@ def find_random_routes(
                 if base_asset in MAJOR_COINS:
                     major_assets.append(base_asset)
         
-        logger.info(f"Found {len(usdt_assets)} assets trading with {base}")
-        logger.info(f"Found {len(major_assets)} major coins trading with {base}: {major_assets[:10]}...")
-        if not major_assets:
-            logger.warning("No major coins (BTC/ETH/BNB) trading with base asset; cannot build required routes")
+        logger.info(f"Found {len(usdt_assets)} assets with {base}, {len(major_assets)} major coins")
+        
+        if not major_assets or len(usdt_assets) < 10:
+            logger.warning("Insufficient assets for triangular arbitrage")
             return [], stats
         
-        if len(usdt_assets) < 10:
-            logger.warning(f"Need at least 10 assets trading with {base}")
-            return [], stats
-
-        top_symbols = [f"{asset}{base}" for asset in usdt_assets[:200]]
-        # _book_ticker_stream.start(top_symbols)  # WebSocket disabled
-        logger.info(f"WebSocket disabled - using REST API only") 
-        
-        # Also include major/alt cross pairs in WebSocket
-        cross_symbols = []
+        # Start WebSocket for real-time price updates
+        ws_symbols = [f"{asset}{base}" for asset in usdt_assets[:200]]
+        # Also include cross pairs for triangular routes
         for major in major_assets:
-            for asset in usdt_assets:
-                if asset == major or asset in MAJOR_COINS:
-                    continue
-                # Check both directions
-                if f"{asset}{major}" in symbols:
-                    cross_symbols.append(f"{asset}{major}")
-                elif f"{major}{asset}" in symbols:
-                    cross_symbols.append(f"{major}{asset}")
+            for alt in usdt_assets[:100]:
+                if alt != major and alt not in MAJOR_COINS:
+                    ws_symbols.append(f"{alt}{major}")
+                    ws_symbols.append(f"{major}{alt}")
         
-        if cross_symbols:
-            # _book_ticker_stream.start(list(set(top_symbols + cross_symbols[:500])))  # WebSocket disabled
-            logger.info(f"Cross pairs identified: {len(cross_symbols[:500])} (WebSocket disabled)")
+        if _book_ticker_stream.start(ws_symbols):
+            # Give WebSocket time to receive initial data
+            time.sleep(0.5)
+            ws_stats = _book_ticker_stream.get_stats()
+            logger.info(f"WebSocket: {ws_stats['cached']} prices cached from {ws_stats['subscribed']} subscriptions")
+            stats["websocket_enabled"] = True
+        else:
+            logger.info("Using REST API for price data (WebSocket unavailable)")
+            stats["websocket_enabled"] = False
         
-        # Exhaustive exploration setup
-        cand: List[CandidateRoute] = []
-        
-        # Pre-fetch some depths to speed up checks
-        # Fetch depths for most common symbols
-        common_symbols = []
-        for asset in random.sample(usdt_assets, min(100, len(usdt_assets))):
-            common_symbols.append(f"{asset}{base}")
-        
-        # Add major/base pairs
-        for major in major_assets:
-            common_symbols.append(f"{major}{base}")
-        
-        depth_cache = {}
-        if common_symbols:
-            logger.info(f"Pre-fetching depths for {len(common_symbols)} common symbols...")
-            for symbol in common_symbols:
-                depth = _depth_snapshot(client, symbol, use_cache=True)
-                if depth:
-                    depth_cache[symbol] = depth
-
-        # Build full list of (major, alt) pairs to test
+        # Build (major, alt) pairs
         all_pairs: List[Tuple[str, str]] = []
         seen_pairs: set = set()
         
-        # Generate all valid (major, alt) combinations
         for major in set(major_assets):
             for alt in set(usdt_assets):
                 if alt == major or alt in MAJOR_COINS:
@@ -767,15 +607,27 @@ def find_random_routes(
                 all_pairs.append((major, alt))
                 stats["unique_assets_tried"].add(major)
                 stats["unique_assets_tried"].add(alt)
-                stats["unique_pairs_tried"].add(tuple(sorted([major, alt])))
         
         stats["attempts"] = len(all_pairs)
-        stats["random_checks"] = len(all_pairs)
-        logger.info(f"Planned exhaustive checks for {len(all_pairs)} (major, alt) combinations")
-
-        # Check triangles in parallel or sequentially over all pairs
+        logger.info(f"Checking {len(all_pairs)} (major, alt) combinations")
+        
+        # Thread-safe depth cache for parallel execution
+        depth_cache = {}
+        depth_cache_lock = threading.Lock()
+        
+        def get_cached_depth(symbol: str) -> Optional[dict]:
+            with depth_cache_lock:
+                return depth_cache.get(symbol)
+        
+        def set_cached_depth(symbol: str, data: dict):
+            with depth_cache_lock:
+                depth_cache[symbol] = data
+        
+        cand: List[CandidateRoute] = []
+        
+        # Parallel execution
         if use_parallel and len(all_pairs) > 10:
-            with ThreadPoolExecutor(max_workers=2) as executor:  # Reduce from 4 to 2 workers
+            with ThreadPoolExecutor(max_workers=4) as executor:
                 futures = []
                 for major, alt in all_pairs:
                     futures.append(
@@ -790,34 +642,25 @@ def find_random_routes(
                             max_profit_pct=max_profit_pct,
                             depth_cache=depth_cache,
                             stats=stats,
+                            stats_lock=stats_lock,
                         )
                     )
-
+                
                 for i, future in enumerate(as_completed(futures), start=1):
                     try:
                         route = future.result()
                         if route:
-                            route_key = (route.a, route.b, route.c)
-                            if not any(
-                                r.a == route.a and r.b == route.b and r.c == route.c
-                                for r in cand
-                            ):
+                            if not any(r.a == route.a and r.b == route.b and r.c == route.c for r in cand):
                                 cand.append(route)
-                                logger.info(
-                                    f"✅ Found route #{len(cand)}: {route.profit_pct}% profit"
-                                )
+                                logger.info(f"✅ Route #{len(cand)}: {route.profit_pct}% net profit")
                     except Exception as e:
                         logger.debug(f"Triangle check failed: {e}")
-
-                    # Periodic progress logging
+                    
                     if i % 100 == 0:
                         elapsed = time.time() - start_time
-                        logger.info(
-                            f"Progress: {i}/{len(all_pairs)} combinations checked, "
-                            f"{len(cand)} routes found, {elapsed:.1f}s elapsed"
-                        )
+                        logger.info(f"Progress: {i}/{len(all_pairs)}, {len(cand)} routes, {elapsed:.1f}s")
         else:
-            # Sequential exhaustive checking
+            # Sequential execution
             for i, (major, alt) in enumerate(all_pairs, start=1):
                 route = _try_triangle_pattern(
                     client=client,
@@ -830,55 +673,27 @@ def find_random_routes(
                     depth_cache=depth_cache,
                     stats=stats,
                 )
-
+                
                 if route:
-                    route_key = (route.a, route.b, route.c)
-                    if not any(
-                        r.a == route.a and r.b == route.b and r.c == route.c
-                        for r in cand
-                    ):
+                    if not any(r.a == route.a and r.b == route.b and r.c == route.c for r in cand):
                         cand.append(route)
-                        logger.info(
-                            f"✅ Found route #{len(cand)}: {route.profit_pct}% profit"
-                        )
-
+                
                 if i % 100 == 0:
                     elapsed = time.time() - start_time
-                    logger.info(
-                        f"Progress: {i}/{len(all_pairs)} combinations checked, "
-                        f"{len(cand)} routes found, {elapsed:.1f}s elapsed"
-                    )
+                    logger.info(f"Progress: {i}/{len(all_pairs)}, {len(cand)} routes, {elapsed:.1f}s")
         
-        # Calculate final stats
+        # Final stats
         total_time = time.time() - start_time
         stats["total_time"] = total_time
         stats["routes_found"] = len(cand)
         
-        if stats["attempts"] > 0:
-            success_rate = (len(cand) / stats["attempts"]) * 100
-            stats["success_rate"] = round(success_rate, 4)
-        
-        # Log results
-        logger.info(f"=== EXPLORATION COMPLETE ===")
-        logger.info(f"Total checks: {stats['attempts']}")
-        logger.info(f"Routes found: {len(cand)}")
-        logger.info(f"Success rate: {stats.get('success_rate', 0):.4f}%")
-        logger.info(f"Total time: {total_time:.2f}s")
-        logger.info(f"Unique assets explored: {len(stats['unique_assets_tried'])}")
-        logger.info(f"Unique pairs explored: {len(stats['unique_pairs_tried'])}")
-        if stats.get("filtered_major_pattern", 0) > 0:
-            logger.info(f"Filtered (invalid major/non-major pattern): {stats['filtered_major_pattern']}")
+        logger.info(f"=== SCAN COMPLETE ===")
+        logger.info(f"Total checks: {stats['attempts']}, Routes found: {len(cand)}")
+        logger.info(f"Time: {total_time:.2f}s, Fee applied: {stats['fee_pct_applied']:.2f}%")
         
         if cand:
             profits = [r.profit_pct for r in cand]
             logger.info(f"Profit range: {min(profits):.4f}% - {max(profits):.4f}%")
-            logger.info(f"Average profit: {sum(profits)/len(profits):.4f}%")
-            
-            # Log all found routes
-            for i, route in enumerate(cand, 1):
-                logger.info(f"Route #{i}: {route.profit_pct}% - {route.a} → {route.b} → {route.c}")
-        else:
-            logger.warning("No profitable routes found in target range")
         
         # Sort by profit (highest first)
         cand.sort(key=lambda x: x.profit_pct, reverse=True)
@@ -886,38 +701,16 @@ def find_random_routes(
         return cand[:max_routes], stats
         
     except Exception as e:
-        logger.error(f"Error in random exploration: {e}", exc_info=True)
+        logger.error(f"Error in route scan: {e}", exc_info=True)
         return [], stats
 
 
-# Keep your existing helper functions for backward compatibility
-def find_candidate_routes(
-    *, 
-    min_profit_pct: float, 
-    max_profit_pct: float,
-    available_balance: float = None
-) -> Tuple[List[CandidateRoute], dict]:
-    """
-    Wrapper to use random exploration by default.
-    """
-    return find_random_routes(
-        min_profit_pct=min_profit_pct,
-        max_profit_pct=max_profit_pct,
-        available_balance=available_balance,
-        max_attempts=getattr(S, "MAX_RANDOM_ATTEMPTS", 2000),
-        max_routes=getattr(S, "MAX_ROUTES_TO_RETURN", 10),
-        use_parallel=True
-    )
-
-
 def _parse_leg(label: str) -> Tuple[str, str, str]:
-    """Parse leg label like "BTC/USDT buy" into (base, quote, side)"""
+    """Parse leg label like 'BTC/USDT buy' into (base, quote, side)"""
     try:
         label = label.strip()
         if ":" in label:
             pair, side = label.split(":", 1)
-            pair = pair.strip()
-            side = side.strip()
         else:
             parts = label.split()
             if len(parts) < 2:
@@ -942,18 +735,13 @@ def revalidate_route(route: CandidateRoute) -> Optional[CandidateRoute]:
         c_base, c_quote, _ = _parse_leg(route.c)
         base = S.BASE_ASSET.upper()
         
-        # Extract major and alt from the route
-        # Pattern 1: MAJOR/BASE buy -> ALT/MAJOR buy -> ALT/BASE sell
-        # Pattern 2: ALT/BASE buy -> ALT/MAJOR sell -> MAJOR/BASE sell
-        
+        # Determine major and alt from route pattern
         if "buy" in route.a and "buy" in route.b and "sell" in route.c:
-            # Pattern 1
-            major = a_base  # First leg base is major
-            alt = c_base    # Third leg base is alt
+            major = a_base
+            alt = c_base
         elif "buy" in route.a and "sell" in route.b and "sell" in route.c:
-            # Pattern 2
-            major = c_base  # Third leg base is major
-            alt = a_base    # First leg base is alt
+            major = c_base
+            alt = a_base
         else:
             logger.warning(f"Cannot determine pattern for route: {route}")
             return None
@@ -961,28 +749,21 @@ def revalidate_route(route: CandidateRoute) -> Optional[CandidateRoute]:
         client = _client()
         symbols = _load_symbols(client)
         
-        # For revalidation, do not enforce a minimum profit tied to the
-        # original route's profit. Allow any reasonable profit within a
-        # wide fixed range; _try_triangle_pattern itself already filters
-        # out extreme values beyond (-50, 50).
-        min_prof = -50.0
-        max_prof = 50.0
-        
-        # Re-run triangle check
+        # Use wide range for revalidation
         new_route = _try_triangle_pattern(
             client, 
             symbols, 
             base, 
             major, 
             alt,
-            min_profit_pct=min_prof,
-            max_profit_pct=max_prof
+            min_profit_pct=-50.0,
+            max_profit_pct=50.0
         )
         
         if new_route:
-            logger.info(f"Route revalidated: {major}/{base}->{alt}/{major}->{alt}/{base} profit={new_route.profit_pct:.4f}%")
+            logger.info(f"Route revalidated: {new_route.profit_pct:.4f}% net profit")
         else:
-            logger.warning(f"Route validation failed: {major}/{base}->{alt}/{major}->{alt}/{base}")
+            logger.warning(f"Route validation failed")
         
         return new_route
     except Exception as e:
@@ -990,32 +771,5 @@ def revalidate_route(route: CandidateRoute) -> Optional[CandidateRoute]:
         return None
 
 
-def debug_random_exploration():
-    """Debug function to test random exploration"""
-    print("\n=== TESTING EXPLORATION ===")
-    
-    # Test with wide profit range to see what's available
-    routes, stats = find_random_routes(
-        min_profit_pct=0.1,
-        max_profit_pct=10.0,
-        max_attempts=500,
-        max_routes=5,
-        use_parallel=False
-    )
-    
-    print(f"\nResults: {len(routes)} routes found")
-    for i, route in enumerate(routes, 1):
-        print(f"{i}. {route.profit_pct:.4f}% - {route.a} → {route.b} → {route.c}")
-    
-    print(f"\nStats:")
-    print(f"  Attempts: {stats.get('attempts', 0)}")
-    print(f"  Unique assets: {len(stats.get('unique_assets_tried', set()))}")
-    print(f"  Unique pairs: {len(stats.get('unique_pairs_tried', set()))}")
-    print(f"  Success rate: {stats.get('success_rate', 0):.4f}%")
-    
-    return routes, stats
-
-
-# Add to settings for configuration:
-# MAX_RANDOM_ATTEMPTS = 2000  # How many random pairs to try
-# USE_RANDOM_EXPLORATION = True  # Set to True to use random instead of priority-based
+# Backward compatibility alias
+find_random_routes = find_candidate_routes
