@@ -26,70 +26,11 @@ from apps.core.tasks import scan_triangular_routes
 
 
 def t(key: str, lang: str = None) -> str:
-    """Translation function. If lang is None, uses database or .env"""
-    if lang is None:
-        # Try to get from database (for use in async handlers)
-        try:
-            from apps.core.models import BotSettings
-            cfg = BotSettings.objects.filter(id=1).first()
-            if cfg and cfg.bot_language:
-                lang = cfg.bot_language
-            else:
-                lang = S.BOT_LANGUAGE
-        except Exception:
-            lang = S.BOT_LANGUAGE
-    ru = {
-        "ready": "Бот готов. Используйте кнопки, чтобы управлять сканированием.",
-        "config": "Настройки бота",
-        "config_menu": "⚙️ Настройки бота\n\nВыберите параметр для изменения:",
-        "tri": "Здесь вы будете получать маршруты треугольного арбитража.",
-        "direct": "Прямой арбитраж пока не реализован.",
-        "history": "История сделок будет доступна позже.",
-        "toggle": "Поиск переключен",
-        "route_missing": "Маршрут больше не существует",
-        "not_valid": "Маршрут сейчас невалиден",
-        "revalidated": "Маршрут обновлён",
-        "trade_disabled": "Трейдинг выключен (TRADING_ENABLED=false)",
-        "exec_started": "Исполнение ожидает подтверждения",
-        "exec_done": "Цикл выполнен",
-        "exec_failed": "Ошибка исполнения",
-        "confirm_title": "Подтвердите исполнение:",
-        "confirm_btn": "Подтвердить",
-        "cancel_btn": "Отмена",
-        "cancelled": "Отменено",
-        "start_search": "Запустить поиск",
-        "stop_search": "Остановить поиск",
-        "check": "Проверить актуальность",
-        "exec": "Исполнить сделку",
-        "settings_saved": "Настройки сохранены",
-        "min_profit": "Мин. прибыль",
-        "max_profit": "Макс. прибыль",
-        "min_notional": "Мин. сумма",
-        "max_notional": "Макс. сумма",
-        "back": "Назад",
-        "current_value": "Текущее значение",
-        "enter_new_value": "Введите новое значение",
-        "language": "Язык",
-        "scanning": "Сканирование",
-        "base_asset": "Базовый актив",
-        "select_language": "Выберите язык:",
-        "select_preset": "Выберите значение:",
-        "enabled": "Включено",
-        "disabled": "Выключено",
-        "toggle_scanning": "Переключить сканирование",
-        "use_entire_balance": "Использовать весь баланс",
-        "entire_balance": "Весь баланс",
-        "fixed_amount": "Фиксированная сумма",
-        "scan_started": "Сканирование запущено",
-        "scan_summary": "Сводка сканирования",
-        "symbols_loaded": "Символов загружено",
-        "depths_fetched": "Глубин получено",
-        "triangles_checked": "Треугольников проверено",
-        "routes_found": "Маршрутов найдено",
-        "routes_created": "Маршрутов создано",
-        "no_routes_found": "Прибыльных маршрутов не найдено",
-        "routes_saved": "маршрут(ов) сохранено в базу данных",
-    }
+    """Translation function. Always returns English."""
+    # Force English
+    lang = "en"
+
+    
     en = {
         "ready": "Arbitrage bot ready. Use buttons to control scanning.",
         "config": "Bot Settings",
@@ -142,7 +83,8 @@ def t(key: str, lang: str = None) -> str:
         "no_routes_found": "No profitable routes found in this scan",
         "routes_saved": "route(s) saved to database",
     }
-    return ru.get(key) if lang and lang.lower().startswith("ru") else en.get(key)
+    # Directly return English text
+    return en.get(key, key)
 
 
 async def kb_global():
@@ -177,7 +119,7 @@ def kb_settings_menu(lang: str = None):
         [InlineKeyboardButton(text=t("min_notional", lang), callback_data="config:min_notional")],
         [InlineKeyboardButton(text=t("max_notional", lang), callback_data="config:max_notional")],
         [InlineKeyboardButton(text="💰 " + t("use_entire_balance", lang), callback_data="config:use_entire_balance")],
-        [InlineKeyboardButton(text="🌐 " + t("language", lang), callback_data="config:language")],
+        # Language toggle removed
         [InlineKeyboardButton(text="🔄 " + t("toggle_scanning", lang), callback_data="config:toggle_scan")],
         [InlineKeyboardButton(text="🔙 " + t("back", lang), callback_data="config:back")],
     ])
@@ -212,24 +154,7 @@ def kb_setting_presets(setting: str, current_val: float, unit: str, lang: str = 
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
 
-def kb_language_presets(current_lang: str, lang: str = None):
-    """Create language selection buttons"""
-    languages = [
-        ("en", "English", "🇬🇧"),
-        ("ru", "Русский", "🇷🇺"),
-    ]
-    buttons = []
-    for code, name, flag in languages:
-        if code == current_lang:
-            label = f"✓ {flag} {name}"
-        else:
-            label = f"{flag} {name}"
-        buttons.append([InlineKeyboardButton(
-            text=label,
-            callback_data=f"set:language:{code}"
-        )])
-    buttons.append([InlineKeyboardButton(text="🔙 " + t("back", lang), callback_data="config:back")])
-    return InlineKeyboardMarkup(inline_keyboard=buttons)
+# kb_language_presets removed
 
 
 async def main():
@@ -284,7 +209,7 @@ async def main():
             cfg.bot_language = S.BOT_LANGUAGE
             await sync_to_async(cfg.save)()
         lang = cfg.bot_language
-        lang_display = "🇷🇺 Русский" if lang == "ru" else "🇬🇧 English"
+        # lang_display removed
         scanning_status = f"✅ {t('enabled', lang)}" if cfg.scanning_enabled else f"❌ {t('disabled', lang)}"
         balance_mode_status = f"✅ {t('enabled', lang)}" if cfg.use_entire_balance else f"❌ {t('disabled', lang)}"
         text = (
@@ -294,7 +219,7 @@ async def main():
             f"💰 {t('min_notional', lang)}: ${cfg.min_notional_usd:,.0f}\n"
             f"💰 {t('max_notional', lang)}: ${cfg.max_notional_usd:,.0f}\n"
             f"💵 {t('use_entire_balance', lang)}: {balance_mode_status}\n"
-            f"🌐 {t('language', lang)}: {lang_display}\n"
+            # Language display line removed
             f"🔄 {t('scanning', lang)}: {scanning_status}\n"
             f"💱 {t('base_asset', lang)}: {cfg.base_asset}"
         )
@@ -513,7 +438,7 @@ async def main():
             cfg.bot_language = S.BOT_LANGUAGE
             await sync_to_async(cfg.save)()
         lang = cfg.bot_language
-        lang_display = "🇷🇺 Русский" if lang == "ru" else "🇬🇧 English"
+        # lang_display removed
         scanning_status = f"✅ {t('enabled', lang)}" if cfg.scanning_enabled else f"❌ {t('disabled', lang)}"
         balance_mode_status = f"✅ {t('enabled', lang)}" if cfg.use_entire_balance else f"❌ {t('disabled', lang)}"
         text = (
@@ -523,7 +448,7 @@ async def main():
             f"💰 {t('min_notional', lang)}: ${cfg.min_notional_usd:,.0f}\n"
             f"💰 {t('max_notional', lang)}: ${cfg.max_notional_usd:,.0f}\n"
             f"💵 {t('use_entire_balance', lang)}: {balance_mode_status}\n"
-            f"🌐 {t('language', lang)}: {lang_display}\n"
+            # Language display line removed
             f"🔄 {t('scanning', lang)}: {scanning_status}\n"
             f"💱 {t('base_asset', lang)}: {cfg.base_asset}"
         )
@@ -549,7 +474,7 @@ async def main():
             await cb.answer(f"{t('scanning', lang)} {scanning_status_text}")
             
             # Return to config menu
-            lang_display = "🇷🇺 Русский" if lang == "ru" else "🇬🇧 English"
+            # lang_display removed
             scanning_status = f"✅ {t('enabled', lang)}" if cfg.scanning_enabled else f"❌ {t('disabled', lang)}"
             balance_mode_status = f"✅ {t('enabled', lang)}" if cfg.use_entire_balance else f"❌ {t('disabled', lang)}"
             text = (
@@ -559,7 +484,7 @@ async def main():
                 f"💰 {t('min_notional', lang)}: ${cfg.min_notional_usd:,.0f}\n"
                 f"💰 {t('max_notional', lang)}: ${cfg.max_notional_usd:,.0f}\n"
                 f"💵 {t('use_entire_balance', lang)}: {balance_mode_status}\n"
-                f"🌐 {t('language', lang)}: {lang_display}\n"
+                # Language display line removed
                 f"🔄 {t('scanning', lang)}: {scanning_status}\n"
                 f"💱 {t('base_asset', lang)}: {cfg.base_asset}"
             )
@@ -573,7 +498,7 @@ async def main():
             await cb.answer(f"{t('use_entire_balance', lang)} {balance_status_text}")
             
             # Return to config menu
-            lang_display = "🇷🇺 Русский" if lang == "ru" else "🇬🇧 English"
+            # lang_display removed
             scanning_status = f"✅ {t('enabled', lang)}" if cfg.scanning_enabled else f"❌ {t('disabled', lang)}"
             balance_mode_status = f"✅ {t('enabled', lang)}" if cfg.use_entire_balance else f"❌ {t('disabled', lang)}"
             text = (
@@ -583,7 +508,7 @@ async def main():
                 f"💰 {t('min_notional', lang)}: ${cfg.min_notional_usd:,.0f}\n"
                 f"💰 {t('max_notional', lang)}: ${cfg.max_notional_usd:,.0f}\n"
                 f"💵 {t('use_entire_balance', lang)}: {balance_mode_status}\n"
-                f"🌐 {t('language', lang)}: {lang_display}\n"
+                # Language display line removed
                 f"🔄 {t('scanning', lang)}: {scanning_status}\n"
                 f"💱 {t('base_asset', lang)}: {cfg.base_asset}"
             )
@@ -591,15 +516,8 @@ async def main():
             return
         
         if setting == "language":
-            current_lang = cfg.bot_language or S.BOT_LANGUAGE
-            lang_display = "🇷🇺 Русский" if current_lang == "ru" else "🇬🇧 English"
-            text = (
-                f"🌐 {t('language', lang)}\n\n"
-                f"{t('current_value', lang)}: {lang_display}\n\n"
-                f"{t('select_language', lang)}"
-            )
-            await cb.message.edit_text(text, reply_markup=kb_language_presets(current_lang, lang))
-            await cb.answer()
+            # Language callback removed
+            await cb.answer("Language selection disabled", show_alert=True)
             return
         
         setting_info = {
@@ -639,16 +557,10 @@ async def main():
             await sync_to_async(cfg.save)()
         lang = cfg.bot_language
         
-        # Handle language setting (string, not float)
+        # Handle language setting (disabled)
         if setting == "language":
-            if new_value_str not in ["en", "ru"]:
-                await cb.answer("Invalid language", show_alert=True)
-                return
-            cfg.bot_language = new_value_str
-            await sync_to_async(cfg.save)()
-            lang = new_value_str  # Update lang for response
-            lang_display = "🇷🇺 Русский" if new_value_str == "ru" else "🇬🇧 English"
-            await cb.answer(f"{t('settings_saved', lang)}: {lang_display}")
+            await cb.answer("Language selection disabled", show_alert=True)
+            return
         else:
             # Handle numeric settings
             try:
@@ -674,7 +586,7 @@ async def main():
             await cb.answer(f"{t('settings_saved', lang)}: {new_value}{unit}")
         
         # Return to config menu with updated language
-        lang_display = "🇷🇺 Русский" if lang == "ru" else "🇬🇧 English"
+        # lang_display removed
         scanning_status = f"✅ {t('enabled', lang)}" if cfg.scanning_enabled else f"❌ {t('disabled', lang)}"
         balance_mode_status = f"✅ {t('enabled', lang)}" if cfg.use_entire_balance else f"❌ {t('disabled', lang)}"
         text = (
@@ -684,7 +596,7 @@ async def main():
             f"💰 {t('min_notional', lang)}: ${cfg.min_notional_usd:,.0f}\n"
             f"💰 {t('max_notional', lang)}: ${cfg.max_notional_usd:,.0f}\n"
             f"💵 {t('use_entire_balance', lang)}: {balance_mode_status}\n"
-            f"🌐 {t('language', lang)}: {lang_display}\n"
+            # Language display line removed
             f"🔄 {t('scanning', lang)}: {scanning_status}\n"
             f"💱 {t('base_asset', lang)}: {cfg.base_asset}"
         )
