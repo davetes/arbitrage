@@ -41,3 +41,15 @@ builder = "nixpacks"
 startCommand = "celery -A arbbot beat -l info"
 restartPolicyType = "on_failure"
 restartPolicyMaxRetries = 10
+
+[[services]]
+name = "telegram-bot"
+source = "."
+[services.telegram-bot]
+name = "telegram-bot"
+[services.telegram-bot.build]
+builder = "nixpacks"
+[services.telegram-bot.deploy]
+startCommand = "python apps/telegram_bot/bot.py"
+restartPolicyType = "on_failure"
+restartPolicyMaxRetries = 10

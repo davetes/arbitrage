@@ -1,0 +1,38 @@
+# Copy all these variables to Railway dashboard for ALL services (web, worker, beat)
+
+# DATABASE & CACHE (Railway provides these automatically)
+DATABASE_URL=postgresql://postgres:uUVMwaczRoKkbIQRIlnhQktAhwtmqcYJ@postgres.railway.internal:5432/railway
+REDIS_URL=redis://default:RYiIXocyZNfoGcXVykZYiABKZXswTRdB@redis.railway.internal:6379
+
+# DJANGO SETTINGS
+DJANGO_SECRET_KEY=your-secret-key-here-generate-new-one
+DJANGO_DEBUG=False
+ALLOWED_HOSTS=.railway.app
+
+# BINANCE API (use testnet for safety)
+BINANCE_BASE_URL=https://testnet.binance.vision
+BINANCE_API_KEY=YTfvrqs2qeXXDYtAybuCOckTEhegRSL7m3Wi6CCatPBef0JFpI6scJXSXorUyl6H
+BINANCE_API_SECRET=4VeLo02ZjmLjuFl5InvVrE8cjYz3UbBCYu0pEH1pm0PWmyIBpFIIMZWsFd8gF7in
+
+# TRADING CONFIGURATION
+BASE_ASSET=USDT
+MIN_PROFIT_PCT=0.05
+MAX_PROFIT_PCT=0.5
+MIN_NOTIONAL_USD=10
+MAX_NOTIONAL_USD=1000
+SCAN_INTERVAL_SECONDS=5
+TRADING_ENABLED=False
+FEE_RATE_BPS=10
+EXTRA_FEE_BPS=0
+SLIPPAGE_BPS=10
+MAX_ASSETS=30
+USE_MID_PRICES=false
+EXEC_SAFETY_FACTOR=0.98
+
+# TELEGRAM BOT (optional)
+TELEGRAM_BOT_TOKEN=8168680708:AAHHmZrtrkz-AozjYYQze0s0EW49NXBheqA
+ADMIN_TELEGRAM_ID=911608626
+BOT_LANGUAGE=en
+
+# ADDITIONAL
+PROXY_URL=
