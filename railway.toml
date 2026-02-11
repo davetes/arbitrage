@@ -21,7 +21,7 @@ source = "."
 [services.celery-worker.build]
 builder = "nixpacks"
 [services.celery-worker.deploy]
-startCommand = "celery -A arbbot worker -l info"
+startCommand = "celery -A arbbot worker -l info --uid=1000 --gid=1000"
 restartPolicyType = "on_failure"
 restartPolicyMaxRetries = 10
 
@@ -32,7 +32,7 @@ source = "."
 [services.celery-beat.build]
 builder = "nixpacks"
 [services.celery-beat.deploy]
-startCommand = "celery -A arbbot beat -l info"
+startCommand = "celery -A arbbot beat -l info --uid=1000 --gid=1000"
 restartPolicyType = "on_failure"
 restartPolicyMaxRetries = 10
 
