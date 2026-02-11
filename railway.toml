@@ -1,14 +1,10 @@
 [build]
 builder = "nixpacks"
 
-[deploy]
-startCommand = "python manage.py migrate && gunicorn arbbot.wsgi:application --bind 0.0.0.0:$PORT"
-
 [[services]]
 name = "web"
 source = "."
 [services.web]
-name = "web"
 [services.web.build]
 builder = "nixpacks"
 [services.web.deploy]
@@ -22,7 +18,6 @@ restartPolicyMaxRetries = 10
 name = "celery-worker"
 source = "."
 [services.celery-worker]
-name = "celery-worker"
 [services.celery-worker.build]
 builder = "nixpacks"
 [services.celery-worker.deploy]
@@ -34,7 +29,6 @@ restartPolicyMaxRetries = 10
 name = "celery-beat"
 source = "."
 [services.celery-beat]
-name = "celery-beat"
 [services.celery-beat.build]
 builder = "nixpacks"
 [services.celery-beat.deploy]
@@ -46,7 +40,6 @@ restartPolicyMaxRetries = 10
 name = "telegram-bot"
 source = "."
 [services.telegram-bot]
-name = "telegram-bot"
 [services.telegram-bot.build]
 builder = "nixpacks"
 [services.telegram-bot.deploy]
