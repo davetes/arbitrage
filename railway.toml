@@ -1,0 +1,43 @@
+[build]
+builder = "nixpacks"
+
+[deploy]
+startCommand = "python manage.py migrate && gunicorn arbbot.wsgi:application --bind 0.0.0.0:$PORT"
+
+[[services]]
+name = "web"
+source = "."
+[services.web]
+name = "web"
+[services.web.build]
+builder = "nixpacks"
+[services.web.deploy]
+startCommand = "python manage.py migrate && gunicorn arbbot.wsgi:application --bind 0.0.0.0:$PORT"
+healthcheckPath = "/admin/"
+healthcheckTimeout = 300
+restartPolicyType = "on_failure"
+restartPolicyMaxRetries = 10
+
+[[services]]
+name = "celery-worker"
+source = "."
+[services.celery-worker]
+name = "celery-worker"
+[services.celery-worker.build]
+builder = "nixpacks"
+[services.celery-worker.deploy]
+startCommand = "celery -A arbbot worker -l info"
+restartPolicyType = "on_failure"
+restartPolicyMaxRetries = 10
+
+[[services]]
+name = "celery-beat"
+source = "."
+[services.celery-beat]
+name = "celery-beat"
+[services.celery-beat.build]
+builder = "nixpacks"
+[services.celery-beat.deploy]
+startCommand = "celery -A arbbot beat -l info"
+restartPolicyType = "on_failure"
+restartPolicyMaxRetries = 10
