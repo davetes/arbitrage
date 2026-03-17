@@ -4,6 +4,7 @@ import sys
 import django
 from pathlib import Path
 import logging
+import httpx
 
 BASE_DIR = Path(__file__).resolve().parents[2]
 # Ensure project root is importable so 'arbbot' package can be found
@@ -85,6 +86,19 @@ def t(key: str, lang: str = None) -> str:
     }
     # Directly return English text
     return en.get(key, key)
+
+
+async def get_binance_status():
+    base_url = S.BINANCE_BASE_URL.rstrip("/")
+    url = f"{base_url}/api/v3/ping"
+    try:
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            resp = await client.get(url)
+        if resp.status_code == 200:
+            return True, "OK"
+        return False, f"HTTP {resp.status_code}"
+    except Exception as exc:
+        return False, f"Error: {exc.__class__.__name__}"
 
 
 async def kb_global():
@@ -192,9 +206,12 @@ async def main():
         # Add status info
         status_emoji = "✅" if cfg.scanning_enabled else "❌"
         status_text = t("enabled", lang) if cfg.scanning_enabled else t("disabled", lang)
+        binance_ok, binance_msg = await get_binance_status()
+        binance_emoji = "✅" if binance_ok else "❌"
         welcome_text = (
             f"{t('ready', lang)}\n\n"
-            f"{status_emoji} {t('scanning', lang)}: {status_text}"
+            f"{status_emoji} {t('scanning', lang)}: {status_text}\n"
+            f"{binance_emoji} Binance: {binance_msg}"
         )
         
         await msg.answer(
@@ -248,6 +265,8 @@ async def main():
         """Check bot status and configuration"""
         cfg, _ = await sync_to_async(BotSettings.objects.get_or_create)(id=1)
         lang = cfg.bot_language if cfg.bot_language else S.BOT_LANGUAGE
+        binance_ok, binance_msg = await get_binance_status()
+        binance_emoji = "✅" if binance_ok else "❌"
         
         # Check recent routes
         from apps.core.models import Route
@@ -258,6 +277,7 @@ async def main():
         status_text = (
             f"🤖 Bot Status\n\n"
             f"{status_emoji} {t('scanning', lang)}: {t('enabled', lang) if cfg.scanning_enabled else t('disabled', lang)}\n\n"
+            f"{binance_emoji} Binance: {binance_msg}\n\n"
             f"📊 Settings:\n"
             f"   Profit: {cfg.min_profit_pct}% - {cfg.max_profit_pct}%\n"
             f"   Volume: ${cfg.min_notional_usd:,.0f} - ${cfg.max_notional_usd:,.0f}\n"

@@ -64,7 +64,7 @@ venv.bak/
 secrets.json
 
 # Celery
-celerybeat-schedule
+celerybeat-schedule*
 celerybeat.pid
 
 # Logs
