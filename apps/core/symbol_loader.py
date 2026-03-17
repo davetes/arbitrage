@@ -8,8 +8,46 @@ from binance.spot import Spot as BinanceClient
 from arbbot import settings as S
 import time
 import logging
+import json
+import redis
 
 logger = logging.getLogger(__name__)
+
+_SYMBOL_STATUS_KEY = "arbbot:symbols:status"
+
+
+def _get_redis():
+    url = getattr(S, "REDIS_URL", "")
+    if not url:
+        return None
+    try:
+        return redis.from_url(url, decode_responses=True)
+    except Exception:
+        return None
+
+
+def _set_symbol_status(ok: bool, message: str):
+    client = _get_redis()
+    if not client:
+        return
+    payload = {"ok": ok, "message": message, "ts": time.time()}
+    try:
+        client.set(_SYMBOL_STATUS_KEY, json.dumps(payload), ex=3600)
+    except Exception:
+        pass
+
+
+def get_symbol_status():
+    client = _get_redis()
+    if not client:
+        return None
+    try:
+        raw = client.get(_SYMBOL_STATUS_KEY)
+        if not raw:
+            return None
+        return json.loads(raw)
+    except Exception:
+        return None
 
 
 class FastSymbolLoader:
@@ -168,6 +206,7 @@ class FastSymbolLoader:
                     f"Loaded {len(filtered)} symbols with quotes in { {'USDT','BTC','ETH','BNB','FDUSD','USDC'} } "
                     f"in {fetch_time:.2f}s (filtered in {filter_time:.3f}s, cached for {self.cache_ttl}s)"
                 )
+                _set_symbol_status(True, "OK")
                 return filtered.copy()
                 
             except Exception as e:
@@ -194,6 +233,7 @@ class FastSymbolLoader:
             f"All API attempts failed, using fallback symbols ({len(self.MAJOR_PAIRS)} pairs). "
             f"Last error: {last_err}"
         )
+        _set_symbol_status(False, "Symbols API failed, using fallback")
         fallback = self._create_fallback_symbols(base_asset)
         # Cache fallback too (but with shorter TTL would be better, keeping same for simplicity)
         self._cache = fallback

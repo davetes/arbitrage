@@ -5,6 +5,8 @@ import django
 from pathlib import Path
 import logging
 import httpx
+import json
+import redis
 
 BASE_DIR = Path(__file__).resolve().parents[2]
 # Ensure project root is importable so 'arbbot' package can be found
@@ -99,6 +101,23 @@ async def get_binance_status():
         return False, f"HTTP {resp.status_code}"
     except Exception as exc:
         return False, f"Error: {exc.__class__.__name__}"
+
+
+def get_symbols_api_status():
+    url = getattr(S, "REDIS_URL", "")
+    if not url:
+        return None
+    try:
+        client = redis.from_url(url, decode_responses=True)
+        raw = client.get("arbbot:symbols:status")
+        if not raw:
+            return None
+        data = json.loads(raw)
+        ok = bool(data.get("ok", False))
+        message = data.get("message", "")
+        return ok, message
+    except Exception:
+        return None
 
 
 def _format_price_value(price: float) -> str:
@@ -234,10 +253,17 @@ async def main():
         status_text = t("enabled", lang) if cfg.scanning_enabled else t("disabled", lang)
         binance_ok, binance_msg = await get_binance_status()
         binance_emoji = "✅" if binance_ok else "❌"
+        symbols_status = get_symbols_api_status()
+        symbols_line = ""
+        if symbols_status:
+            symbols_ok, symbols_msg = symbols_status
+            symbols_emoji = "✅" if symbols_ok else "❌"
+            symbols_line = f"\n{symbols_emoji} Symbols API: {symbols_msg}"
         welcome_text = (
             f"{t('ready', lang)}\n\n"
             f"{status_emoji} {t('scanning', lang)}: {status_text}\n"
             f"{binance_emoji} Binance: {binance_msg}"
+            f"{symbols_line}"
         )
         
         await msg.answer(
@@ -293,6 +319,12 @@ async def main():
         lang = cfg.bot_language if cfg.bot_language else S.BOT_LANGUAGE
         binance_ok, binance_msg = await get_binance_status()
         binance_emoji = "✅" if binance_ok else "❌"
+        symbols_status = get_symbols_api_status()
+        symbols_line = ""
+        if symbols_status:
+            symbols_ok, symbols_msg = symbols_status
+            symbols_emoji = "✅" if symbols_ok else "❌"
+            symbols_line = f"{symbols_emoji} Symbols API: {symbols_msg}\n\n"
         
         # Check recent routes
         from apps.core.models import Route
@@ -304,6 +336,7 @@ async def main():
             f"🤖 Bot Status\n\n"
             f"{status_emoji} {t('scanning', lang)}: {t('enabled', lang) if cfg.scanning_enabled else t('disabled', lang)}\n\n"
             f"{binance_emoji} Binance: {binance_msg}\n\n"
+            f"{symbols_line}"
             f"📊 Settings:\n"
             f"   Profit: {cfg.min_profit_pct}% - {cfg.max_profit_pct}%\n"
             f"   Volume: ${cfg.min_notional_usd:,.0f} - ${cfg.max_notional_usd:,.0f}\n"

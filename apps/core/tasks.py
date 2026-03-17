@@ -6,11 +6,40 @@ from arbbot import settings as S
 import json
 import requests
 import logging
+import redis
 from .models import BotSettings, Route
 from .arbitrage import find_candidate_routes, _parse_leg, _client, _depth_snapshot
+from .symbol_loader import get_symbol_status
 from .trading import get_account_balance
 
 logger = logging.getLogger(__name__)
+
+_SYMBOL_ALERT_KEY = "arbbot:symbols:last_alert_ts"
+
+
+def _get_redis():
+    url = getattr(S, "REDIS_URL", "")
+    if not url:
+        return None
+    try:
+        return redis.from_url(url, decode_responses=True)
+    except Exception:
+        return None
+
+
+def _should_alert_symbols(status_ts: float) -> bool:
+    client = _get_redis()
+    if not client:
+        return True
+    try:
+        last_ts_raw = client.get(_SYMBOL_ALERT_KEY)
+        last_ts = float(last_ts_raw) if last_ts_raw else 0.0
+        if last_ts >= status_ts:
+            return False
+        client.set(_SYMBOL_ALERT_KEY, str(status_ts), ex=3600)
+        return True
+    except Exception:
+        return True
 
 
 def _t(key: str, lang: str = None) -> str:
@@ -104,6 +133,22 @@ def scan_triangular_routes():
             max_profit_pct=cfg.max_profit_pct,
             available_balance=available_balance,
         )
+
+        symbols_status = get_symbol_status()
+        if symbols_status and not symbols_status.get("ok", True):
+            status_ts = float(symbols_status.get("ts", 0.0))
+            if _should_alert_symbols(status_ts) and S.TELEGRAM_BOT_TOKEN and S.ADMIN_TELEGRAM_ID:
+                try:
+                    text = "Symbols API failed, using fallback"
+                    url = f"https://api.telegram.org/bot{S.TELEGRAM_BOT_TOKEN}/sendMessage"
+                    payload = {
+                        "chat_id": S.ADMIN_TELEGRAM_ID,
+                        "text": text,
+                        "disable_web_page_preview": True,
+                    }
+                    requests.post(url, data=payload, timeout=10)
+                except Exception as e:
+                    logger.error(f"Failed to send symbols API alert: {e}", exc_info=True)
         
         logger.info(f"Found {len(candidates)} candidate routes")
         
