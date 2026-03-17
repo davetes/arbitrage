@@ -7,7 +7,7 @@ import json
 import requests
 import logging
 from .models import BotSettings, Route
-from .arbitrage import find_candidate_routes
+from .arbitrage import find_candidate_routes, _parse_leg, _client, _depth_snapshot
 from .trading import get_account_balance
 
 logger = logging.getLogger(__name__)
@@ -35,6 +35,32 @@ def _t(key: str, lang: str = None) -> str:
         "exec": "Execute Trade",
     }
     return ru.get(key) if lang and lang.lower().startswith("ru") else en.get(key)
+
+
+def _format_price_value(price: float) -> str:
+    if price >= 1:
+        return f"{price:.2f}"
+    if price >= 0.01:
+        return f"{price:.4f}"
+    return f"{price:.8f}"
+
+
+def _route_price_lines(legs):
+    client = _client(timeout=10)
+    lines = []
+    for leg in legs:
+        try:
+            base, quote, side = _parse_leg(leg)
+            symbol = f"{base}{quote}"
+            depth = _depth_snapshot(client, symbol, use_cache=True)
+            if not depth:
+                lines.append(f"{base}/{quote}: n/a {side}")
+                continue
+            price = depth["ask_price"] if side == "buy" else depth["bid_price"]
+            lines.append(f"{base}/{quote}: {_format_price_value(price)} {side}")
+        except Exception:
+            lines.append(f"{leg}: n/a")
+    return lines
 
 
 @shared_task
@@ -102,7 +128,14 @@ def scan_triangular_routes():
                             [{"text": _t("exec", lang), "callback_data": f"exec:{r.id}"}],
                         ]
                     }
-                    text = f"Route: {r.leg_a} → {r.leg_b} → {r.leg_c}\nProfit: {r.profit_pct:.2f}%\nVolume: ${r.volume_usd:,.0f}"
+                    price_lines = _route_price_lines([r.leg_a, r.leg_b, r.leg_c])
+                    price_block = "\n".join(price_lines)
+                    text = (
+                        f"{price_block}\n\n"
+                        f"Route: {r.leg_a} → {r.leg_b} → {r.leg_c}\n"
+                        f"Profit: {r.profit_pct:.2f}%\n"
+                        f"Volume: ${r.volume_usd:,.0f}"
+                    )
                     url = f"https://api.telegram.org/bot{S.TELEGRAM_BOT_TOKEN}/sendMessage"
                     payload = {
                         "chat_id": S.ADMIN_TELEGRAM_ID,

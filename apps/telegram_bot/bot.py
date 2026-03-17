@@ -20,7 +20,7 @@ from aiogram.exceptions import TelegramBadRequest
 from django.utils import timezone
 from arbbot import settings as S
 from apps.core.models import BotSettings, Route, Execution
-from apps.core.arbitrage import CandidateRoute, revalidate_route
+from apps.core.arbitrage import CandidateRoute, revalidate_route, _parse_leg, _client, _depth_snapshot
 from apps.core.trading import execute_cycle, get_account_balance
 from asgiref.sync import sync_to_async
 from apps.core.tasks import scan_triangular_routes
@@ -99,6 +99,32 @@ async def get_binance_status():
         return False, f"HTTP {resp.status_code}"
     except Exception as exc:
         return False, f"Error: {exc.__class__.__name__}"
+
+
+def _format_price_value(price: float) -> str:
+    if price >= 1:
+        return f"{price:.2f}"
+    if price >= 0.01:
+        return f"{price:.4f}"
+    return f"{price:.8f}"
+
+
+def _route_price_lines(legs):
+    client = _client(timeout=10)
+    lines = []
+    for leg in legs:
+        try:
+            base, quote, side = _parse_leg(leg)
+            symbol = f"{base}{quote}"
+            depth = _depth_snapshot(client, symbol, use_cache=True)
+            if not depth:
+                lines.append(f"{base}/{quote}: n/a {side}")
+                continue
+            price = depth["ask_price"] if side == "buy" else depth["bid_price"]
+            lines.append(f"{base}/{quote}: {_format_price_value(price)} {side}")
+        except Exception:
+            lines.append(f"{leg}: n/a")
+    return lines
 
 
 async def kb_global():
@@ -377,7 +403,14 @@ async def main():
                 await cb.answer(error_msg, show_alert=True)
             else:
                 logging.info(f"Route {route_id} revalidated: profit={new_cand.profit_pct}% volume=${new_cand.volume_usd}")
-                text = f"Route: {new_cand.a} → {new_cand.b} → {new_cand.c}\nProfit: {new_cand.profit_pct:.2f}%\nVolume: ${new_cand.volume_usd:,.0f}"
+                price_lines = await sync_to_async(_route_price_lines)([new_cand.a, new_cand.b, new_cand.c])
+                price_block = "\n".join(price_lines)
+                text = (
+                    f"{price_block}\n\n"
+                    f"Route: {new_cand.a} → {new_cand.b} → {new_cand.c}\n"
+                    f"Profit: {new_cand.profit_pct:.2f}%\n"
+                    f"Volume: ${new_cand.volume_usd:,.0f}"
+                )
                 await cb.message.edit_text(text, reply_markup=kb_route(route_id, lang))
                 await cb.answer(t("revalidated", lang))
         except Exception as e:
@@ -433,8 +466,11 @@ async def main():
             notional = min(new_cand.volume_usd, S.MAX_NOTIONAL_USD, available_balance)
             balance_mode = t("fixed_amount", lang)
         
+        price_lines = await sync_to_async(_route_price_lines)([new_cand.a, new_cand.b, new_cand.c])
+        price_block = "\n".join(price_lines)
         text = (
             f"{t('confirm_title', lang)}\n"
+            f"{price_block}\n\n"
             f"Route: {new_cand.a} → {new_cand.b} → {new_cand.c}\n"
             f"Profit: {new_cand.profit_pct:.2f}%\n"
             f"Available balance: ${available_balance:,.2f}\n"
