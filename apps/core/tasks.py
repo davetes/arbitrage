@@ -8,7 +8,7 @@ import requests
 import logging
 import redis
 from .models import BotSettings, Route, Execution
-from .arbitrage import find_candidate_routes, _parse_leg, _client, _depth_snapshot, CandidateRoute, revalidate_route
+from .arbitrage import find_candidate_routes, _parse_leg, _client, _depth_snapshot, CandidateRoute, revalidate_route, ensure_ws_symbols
 from .symbol_loader import get_symbol_status
 from .trading import execute_cycle, get_account_balance
 
@@ -77,6 +77,14 @@ def _format_price_value(price: float) -> str:
 def _route_price_lines(legs):
     client = _client(timeout=10)
     lines = []
+    symbols = []
+    for leg in legs:
+        try:
+            base, quote, _ = _parse_leg(leg)
+            symbols.append(f"{base}{quote}")
+        except Exception:
+            continue
+    ensure_ws_symbols(list(dict.fromkeys(symbols)))
     for leg in legs:
         try:
             base, quote, side = _parse_leg(leg)

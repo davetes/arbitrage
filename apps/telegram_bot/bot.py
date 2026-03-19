@@ -22,7 +22,7 @@ from aiogram.exceptions import TelegramBadRequest
 from django.utils import timezone
 from arbbot import settings as S
 from apps.core.models import BotSettings, Route, Execution
-from apps.core.arbitrage import CandidateRoute, revalidate_route, _parse_leg, _client, _depth_snapshot
+from apps.core.arbitrage import CandidateRoute, revalidate_route, _parse_leg, _client, _depth_snapshot, ensure_ws_symbols, get_ws_stats
 from apps.core.trading import execute_cycle, get_account_balance
 from asgiref.sync import sync_to_async
 from apps.core.tasks import scan_triangular_routes
@@ -96,7 +96,7 @@ async def get_binance_status():
     base_url = S.BINANCE_BASE_URL.rstrip("/")
     url = f"{base_url}/api/v3/ping"
     try:
-        async with httpx.AsyncClient(timeout=5.0) as client:
+        async with httpx.AsyncClient(timeout=2.5) as client:
             resp = await client.get(url)
         if resp.status_code == 200:
             return True, "OK"
@@ -122,6 +122,14 @@ def get_symbols_api_status():
         return None
 
 
+async def _fetch_external_status():
+    binance_task = asyncio.create_task(get_binance_status())
+    symbols_task = asyncio.create_task(sync_to_async(get_symbols_api_status, thread_sensitive=True)())
+    binance_ok, binance_msg = await binance_task
+    symbols_status = await symbols_task
+    return binance_ok, binance_msg, symbols_status
+
+
 def _format_price_value(price: float) -> str:
     if price >= 1:
         return f"{price:.2f}"
@@ -133,6 +141,14 @@ def _format_price_value(price: float) -> str:
 def _route_price_lines(legs):
     client = _client(timeout=10)
     lines = []
+    symbols = []
+    for leg in legs:
+        try:
+            base, quote, _ = _parse_leg(leg)
+            symbols.append(f"{base}{quote}")
+        except Exception:
+            continue
+    ensure_ws_symbols(list(dict.fromkeys(symbols)))
     for leg in legs:
         try:
             base, quote, side = _parse_leg(leg)
@@ -236,6 +252,7 @@ async def main():
         BotCommand(command="start", description="Start the arbitrage bot"),
         BotCommand(command="config", description="Configure your bot settings"),
         BotCommand(command="autotrade", description="Toggle auto trade"),
+        BotCommand(command="top_routes", description="Show top 10 routes"),
         BotCommand(command="triangular_alerts", description="Get triangular arbitrage alerts"),
         BotCommand(command="direct_alerts", description="Get direct arbitrage alerts"),
         BotCommand(command="transaction_history", description="Get transaction history"),
@@ -255,25 +272,42 @@ async def main():
         # Add status info
         status_emoji = "✅" if cfg.scanning_enabled else "❌"
         status_text = t("enabled", lang) if cfg.scanning_enabled else t("disabled", lang)
-        binance_ok, binance_msg = await get_binance_status()
-        binance_emoji = "✅" if binance_ok else "❌"
-        symbols_status = get_symbols_api_status()
-        symbols_line = ""
-        if symbols_status:
-            symbols_ok, symbols_msg = symbols_status
-            symbols_emoji = "✅" if symbols_ok else "❌"
-            symbols_line = f"\n{symbols_emoji} Symbols API: {symbols_msg}"
         welcome_text = (
             f"{t('ready', lang)}\n\n"
             f"{status_emoji} {t('scanning', lang)}: {status_text}\n"
-            f"{binance_emoji} Binance: {binance_msg}"
-            f"{symbols_line}"
+            f"⏳ Checking Binance and Symbols..."
         )
-        
-        await msg.answer(
-            welcome_text,
-            reply_markup=reply_kb,
-        )
+
+        sent = await msg.answer(welcome_text, reply_markup=reply_kb)
+
+        async def update_start_message():
+            try:
+                binance_ok, binance_msg, symbols_status = await _fetch_external_status()
+                binance_emoji = "✅" if binance_ok else "❌"
+                symbols_line = ""
+                if symbols_status:
+                    symbols_ok, symbols_msg = symbols_status
+                    symbols_emoji = "✅" if symbols_ok else "❌"
+                    symbols_line = f"\n{symbols_emoji} Symbols API: {symbols_msg}"
+                api_status = "Connected" if binance_ok else "Disconnected"
+                ws_stats = get_ws_stats()
+                ws_status = "Connected" if ws_stats.get("running") else "Disconnected"
+                ws_details = f"{ws_stats.get('cached', 0)}/{ws_stats.get('subscribed', 0)}"
+                updated_text = (
+                    f"{t('ready', lang)}\n\n"
+                    f"{status_emoji} {t('scanning', lang)}: {status_text}\n"
+                    f"{binance_emoji} Binance: {binance_msg}\n"
+                    f"🔌 API: {api_status}"
+                    f"\n📡 WS: {ws_status} ({ws_details})"
+                    f"{symbols_line}"
+                )
+                await sent.edit_text(updated_text, reply_markup=reply_kb)
+            except TelegramBadRequest:
+                pass
+            except Exception as exc:
+                logging.error(f"/start status update failed: {exc}", exc_info=True)
+
+        asyncio.create_task(update_start_message())
 
     @dp.message(F.text == "/config")
     async def on_config(msg: Message):
@@ -328,52 +362,89 @@ async def main():
         lang = cfg.bot_language if cfg.bot_language else S.BOT_LANGUAGE
         await msg.answer(t("history", lang))
 
+    @dp.message(F.text == "/top_routes")
+    async def on_top_routes(msg: Message):
+        cfg, _ = await sync_to_async(BotSettings.objects.get_or_create)(id=1)
+        lang = cfg.bot_language if cfg.bot_language else S.BOT_LANGUAGE
+        routes = await sync_to_async(lambda: list(Route.objects.order_by('-profit_pct')[:10]))()
+        if not routes:
+            await msg.answer("No routes found yet.")
+            return
+
+        lines = ["🏆 Top 10 Routes (by profit)"]
+        for idx, r in enumerate(routes, start=1):
+            lines.append(
+                f"{idx}. {r.leg_a} → {r.leg_b} → {r.leg_c} | "
+                f"Profit: {r.profit_pct:.2f}% | Volume: ${r.volume_usd:,.0f}"
+            )
+        await msg.answer("\n".join(lines))
+
     @dp.message(F.text == "/status")
     async def on_status(msg: Message):
         """Check bot status and configuration"""
         cfg, _ = await sync_to_async(BotSettings.objects.get_or_create)(id=1)
         lang = cfg.bot_language if cfg.bot_language else S.BOT_LANGUAGE
-        binance_ok, binance_msg = await get_binance_status()
-        binance_emoji = "✅" if binance_ok else "❌"
-        symbols_status = get_symbols_api_status()
-        symbols_line = ""
-        if symbols_status:
-            symbols_ok, symbols_msg = symbols_status
-            symbols_emoji = "✅" if symbols_ok else "❌"
-            symbols_line = f"{symbols_emoji} Symbols API: {symbols_msg}\n\n"
-        
-        # Check recent routes
-        from apps.core.models import Route
-        recent_routes = await sync_to_async(lambda: Route.objects.order_by('-id')[:5].count())()
-        total_routes = await sync_to_async(lambda: Route.objects.count())()
-        
         status_emoji = "✅" if cfg.scanning_enabled else "❌"
-        status_text = (
+        base_text = (
             f"🤖 Bot Status\n\n"
             f"{status_emoji} {t('scanning', lang)}: {t('enabled', lang) if cfg.scanning_enabled else t('disabled', lang)}\n\n"
             f"🤖 {t('auto_trade', lang)}: {t('enabled', lang) if cfg.auto_trade_enabled else t('disabled', lang)}\n\n"
-            f"{binance_emoji} Binance: {binance_msg}\n\n"
-            f"{symbols_line}"
-            f"📊 Settings:\n"
-            f"   Profit: {cfg.min_profit_pct}% - {cfg.max_profit_pct}%\n"
-            f"   Volume: ${cfg.min_notional_usd:,.0f} - ${cfg.max_notional_usd:,.0f}\n"
-            f"   Base: {cfg.base_asset}\n\n"
-            f"📈 Routes:\n"
-            f"   Total found: {total_routes}\n"
-            f"   Recent (last 5): {recent_routes}\n\n"
+            f"⏳ Checking Binance, Symbols, and Routes...\n"
         )
-        
-        if cfg.scanning_enabled:
-            status_text += (
-                f"⚠️  Make sure:\n"
-                f"   1. Celery worker is running\n"
-                f"   2. Celery beat is running\n"
-                f"   3. Redis is running\n"
-            )
-        else:
-            status_text += f"💡 Click 'Start Search' to begin scanning"
-        
-        await msg.answer(status_text, reply_markup=await kb_global())
+        sent = await msg.answer(base_text, reply_markup=await kb_global())
+
+        async def update_status_message():
+            try:
+                binance_ok, binance_msg, symbols_status = await _fetch_external_status()
+                binance_emoji = "✅" if binance_ok else "❌"
+                symbols_line = ""
+                if symbols_status:
+                    symbols_ok, symbols_msg = symbols_status
+                    symbols_emoji = "✅" if symbols_ok else "❌"
+                    symbols_line = f"{symbols_emoji} Symbols API: {symbols_msg}\n\n"
+
+                from apps.core.models import Route
+                recent_routes = await sync_to_async(lambda: Route.objects.order_by('-id')[:5].count())()
+                total_routes = await sync_to_async(lambda: Route.objects.count())()
+
+                api_status = "Connected" if binance_ok else "Disconnected"
+                ws_stats = get_ws_stats()
+                ws_status = "Connected" if ws_stats.get("running") else "Disconnected"
+                ws_details = f"{ws_stats.get('cached', 0)}/{ws_stats.get('subscribed', 0)}"
+                status_text = (
+                    f"🤖 Bot Status\n\n"
+                    f"{status_emoji} {t('scanning', lang)}: {t('enabled', lang) if cfg.scanning_enabled else t('disabled', lang)}\n\n"
+                    f"🤖 {t('auto_trade', lang)}: {t('enabled', lang) if cfg.auto_trade_enabled else t('disabled', lang)}\n\n"
+                    f"{binance_emoji} Binance: {binance_msg}\n"
+                    f"🔌 API: {api_status}\n\n"
+                    f"📡 WS: {ws_status} ({ws_details})\n\n"
+                    f"{symbols_line}"
+                    f"📊 Settings:\n"
+                    f"   Profit: {cfg.min_profit_pct}% - {cfg.max_profit_pct}%\n"
+                    f"   Volume: ${cfg.min_notional_usd:,.0f} - ${cfg.max_notional_usd:,.0f}\n"
+                    f"   Base: {cfg.base_asset}\n\n"
+                    f"📈 Routes:\n"
+                    f"   Total found: {total_routes}\n"
+                    f"   Recent (last 5): {recent_routes}\n\n"
+                )
+
+                if cfg.scanning_enabled:
+                    status_text += (
+                        f"⚠️  Make sure:\n"
+                        f"   1. Celery worker is running\n"
+                        f"   2. Celery beat is running\n"
+                        f"   3. Redis is running\n"
+                    )
+                else:
+                    status_text += f"💡 Click 'Start Search' to begin scanning"
+
+                await sent.edit_text(status_text, reply_markup=await kb_global())
+            except TelegramBadRequest:
+                pass
+            except Exception as exc:
+                logging.error(f"/status update failed: {exc}", exc_info=True)
+
+        asyncio.create_task(update_status_message())
 
 
     @dp.callback_query(F.data == "toggle_scan")

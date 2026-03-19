@@ -208,6 +208,25 @@ class BookTickerStream:
 # Global WebSocket stream instance
 _book_ticker_stream = BookTickerStream(ttl_seconds=5.0)
 
+
+def ensure_ws_symbols(symbols: List[str]) -> bool:
+    if not symbols:
+        return False
+    try:
+        started = _book_ticker_stream.start(symbols)
+        if started:
+            time.sleep(0.2)
+        return started
+    except Exception:
+        return False
+
+
+def get_ws_stats() -> dict:
+    try:
+        return _book_ticker_stream.get_stats()
+    except Exception:
+        return {"running": False, "subscribed": 0, "cached": 0}
+
 @dataclass
 class CandidateRoute:
     a: str  # leg1 label e.g., "BTC/USDT buy"
@@ -747,6 +766,12 @@ def revalidate_route(route: CandidateRoute) -> Optional[CandidateRoute]:
             return None
         
         client = _client()
+        ensure_ws_symbols([
+            f"{major}{base}",
+            f"{alt}{base}",
+            f"{alt}{major}",
+            f"{major}{alt}",
+        ])
         symbols = _load_symbols(client)
         
         # Use wide range for revalidation
