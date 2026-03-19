@@ -3,6 +3,7 @@ from django.db import models
 
 class BotSettings(models.Model):
     scanning_enabled = models.BooleanField(default=True)
+    auto_trade_enabled = models.BooleanField(default=False)
     min_profit_pct = models.FloatField(default=1.0)
     max_profit_pct = models.FloatField(default=2.5)
     fee_bps = models.FloatField(default=10)

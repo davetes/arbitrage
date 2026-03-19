@@ -7,10 +7,10 @@ import json
 import requests
 import logging
 import redis
-from .models import BotSettings, Route
-from .arbitrage import find_candidate_routes, _parse_leg, _client, _depth_snapshot
+from .models import BotSettings, Route, Execution
+from .arbitrage import find_candidate_routes, _parse_leg, _client, _depth_snapshot, CandidateRoute, revalidate_route
 from .symbol_loader import get_symbol_status
-from .trading import get_account_balance
+from .trading import execute_cycle, get_account_balance
 
 logger = logging.getLogger(__name__)
 
@@ -92,11 +92,26 @@ def _route_price_lines(legs):
     return lines
 
 
+def _send_telegram_message(text: str, reply_markup: dict = None) -> None:
+    if not (S.TELEGRAM_BOT_TOKEN and S.ADMIN_TELEGRAM_ID):
+        return
+    payload = {
+        "chat_id": S.ADMIN_TELEGRAM_ID,
+        "text": text,
+        "disable_web_page_preview": True,
+    }
+    if reply_markup:
+        payload["reply_markup"] = json.dumps(reply_markup)
+    url = f"https://api.telegram.org/bot{S.TELEGRAM_BOT_TOKEN}/sendMessage"
+    requests.post(url, data=payload, timeout=10)
+
+
 @shared_task
 def scan_triangular_routes():
     try:
         cfg, _ = BotSettings.objects.get_or_create(id=1, defaults={
             "scanning_enabled": True,
+            "auto_trade_enabled": False,
             "min_profit_pct": S.MIN_PROFIT_PCT,
             "max_profit_pct": S.MAX_PROFIT_PCT,
             "fee_bps": S.FEE_RATE_BPS,
@@ -179,23 +194,67 @@ def scan_triangular_routes():
                         f"{price_block}\n\n"
                         f"Route: {r.leg_a} → {r.leg_b} → {r.leg_c}\n"
                         f"Profit: {r.profit_pct:.2f}%\n"
-                        f"Volume: ${r.volume_usd:,.0f}"
+                        f"Volume: ${r.volume_usd:,.0f}\n"
+                        f"Auto-trade: {'enabled' if cfg.auto_trade_enabled else 'disabled'}"
                     )
-                    url = f"https://api.telegram.org/bot{S.TELEGRAM_BOT_TOKEN}/sendMessage"
-                    payload = {
-                        "chat_id": S.ADMIN_TELEGRAM_ID,
-                        "text": text,
-                        "reply_markup": json.dumps(kb),
-                        "disable_web_page_preview": True,
-                    }
-                    if S.TELEGRAM_BOT_TOKEN and S.ADMIN_TELEGRAM_ID:
-                        response = requests.post(url, data=payload, timeout=10)
-                        if response.status_code == 200:
-                            logger.info(f"Telegram notification sent for route {r.id}")
-                        else:
-                            logger.warning(f"Telegram notification failed for route {r.id}: {response.status_code} - {response.text}")
+                    _send_telegram_message(text, reply_markup=kb)
+                    logger.info(f"Telegram notification sent for route {r.id}")
                 except Exception as e:
                     logger.error(f"Failed to send Telegram notification for route {r.id}: {e}", exc_info=True)
+
+                if cfg.auto_trade_enabled:
+                    if not S.TRADING_ENABLED:
+                        logger.warning("Auto-trade enabled but TRADING_ENABLED is false")
+                    else:
+                        try:
+                            cand = CandidateRoute(
+                                a=r.leg_a,
+                                b=r.leg_b,
+                                c=r.leg_c,
+                                profit_pct=r.profit_pct,
+                                volume_usd=r.volume_usd,
+                            )
+                            new_cand = revalidate_route(cand)
+                            if not new_cand:
+                                logger.info(f"Auto-trade skipped (route invalid) for route {r.id}")
+                            else:
+                                balances = get_account_balance(S.BASE_ASSET.upper())
+                                available_balance = balances.get(S.BASE_ASSET.upper(), 0.0)
+                                if cfg.use_entire_balance:
+                                    notional = available_balance * 0.95
+                                    notional = min(notional, new_cand.volume_usd, S.MAX_NOTIONAL_USD)
+                                else:
+                                    notional = min(new_cand.volume_usd, S.MAX_NOTIONAL_USD, available_balance)
+
+                                if notional < S.MIN_NOTIONAL_USD:
+                                    logger.info(
+                                        f"Auto-trade skipped (insufficient balance) for route {r.id}: ${notional:.2f}"
+                                    )
+                                else:
+                                    ex = Execution.objects.create(route=r, status="running", notional_usd=notional)
+                                    try:
+                                        final_base, orders = execute_cycle(new_cand, notional)
+                                        pnl = final_base - notional
+                                        ex.status = "completed"
+                                        ex.pnl_usd = pnl
+                                        ex.finished_at = timezone.now()
+                                        ex.details = {"orders": orders, "final_base": final_base}
+                                        _send_telegram_message(
+                                            f"✅ Auto-trade executed\nRoute: {r.leg_a} → {r.leg_b} → {r.leg_c}\n"
+                                            f"Notional: ${notional:,.2f}\nP&L: ${pnl:,.2f}"
+                                        )
+                                    except Exception as e:
+                                        ex.status = "failed"
+                                        ex.details = {"error": str(e)}
+                                        ex.finished_at = timezone.now()
+                                        _send_telegram_message(
+                                            f"❌ Auto-trade failed\nRoute: {r.leg_a} → {r.leg_b} → {r.leg_c}\n"
+                                            f"Error: {e}"
+                                        )
+                                    finally:
+                                        ex.save()
+                        except Exception as e:
+                            logger.error(f"Auto-trade failed for route {r.id}: {e}", exc_info=True)
         
         # Send summary message to Telegram only when at least one route was created
         try:
@@ -237,17 +296,8 @@ def scan_triangular_routes():
                 # Since created > 0, add saved routes line
                 summary_text += f"\n\n{_get_translation('routes_saved').format(count=created)}"
                 
-                url = f"https://api.telegram.org/bot{S.TELEGRAM_BOT_TOKEN}/sendMessage"
-                payload = {
-                    "chat_id": S.ADMIN_TELEGRAM_ID,
-                    "text": summary_text,
-                    "disable_web_page_preview": True,
-                }
-                response = requests.post(url, data=payload, timeout=10)
-                if response.status_code == 200:
-                    logger.info("Summary message sent to Telegram")
-                else:
-                    logger.warning(f"Failed to send summary message: {response.status_code} - {response.text}")
+                _send_telegram_message(summary_text)
+                logger.info("Summary message sent to Telegram")
         except Exception as e:
             logger.error(f"Failed to send summary message: {e}", exc_info=True)
         

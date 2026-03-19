@@ -73,6 +73,8 @@ def t(key: str, lang: str = None) -> str:
         "enabled": "Enabled",
         "disabled": "Disabled",
         "toggle_scanning": "Toggle Scanning",
+        "auto_trade": "Auto Trade",
+        "toggle_auto_trade": "Toggle Auto Trade",
         "use_entire_balance": "Use Entire Balance",
         "entire_balance": "Entire Balance",
         "fixed_amount": "Fixed Amount",
@@ -178,6 +180,7 @@ def kb_settings_menu(lang: str = None):
         [InlineKeyboardButton(text=t("min_notional", lang), callback_data="config:min_notional")],
         [InlineKeyboardButton(text=t("max_notional", lang), callback_data="config:max_notional")],
         [InlineKeyboardButton(text="💰 " + t("use_entire_balance", lang), callback_data="config:use_entire_balance")],
+        [InlineKeyboardButton(text="🤖 " + t("auto_trade", lang), callback_data="config:auto_trade")],
         # Language toggle removed
         [InlineKeyboardButton(text="🔄 " + t("toggle_scanning", lang), callback_data="config:toggle_scan")],
         [InlineKeyboardButton(text="🔙 " + t("back", lang), callback_data="config:back")],
@@ -232,6 +235,7 @@ async def main():
     commands = [
         BotCommand(command="start", description="Start the arbitrage bot"),
         BotCommand(command="config", description="Configure your bot settings"),
+        BotCommand(command="autotrade", description="Toggle auto trade"),
         BotCommand(command="triangular_alerts", description="Get triangular arbitrage alerts"),
         BotCommand(command="direct_alerts", description="Get direct arbitrage alerts"),
         BotCommand(command="transaction_history", description="Get transaction history"),
@@ -281,6 +285,7 @@ async def main():
         # lang_display removed
         scanning_status = f"✅ {t('enabled', lang)}" if cfg.scanning_enabled else f"❌ {t('disabled', lang)}"
         balance_mode_status = f"✅ {t('enabled', lang)}" if cfg.use_entire_balance else f"❌ {t('disabled', lang)}"
+        auto_trade_status = f"✅ {t('enabled', lang)}" if cfg.auto_trade_enabled else f"❌ {t('disabled', lang)}"
         text = (
             f"{t('config_menu', lang)}\n\n"
             f"📊 {t('min_profit', lang)}: {cfg.min_profit_pct}%\n"
@@ -288,11 +293,22 @@ async def main():
             f"💰 {t('min_notional', lang)}: ${cfg.min_notional_usd:,.0f}\n"
             f"💰 {t('max_notional', lang)}: ${cfg.max_notional_usd:,.0f}\n"
             f"💵 {t('use_entire_balance', lang)}: {balance_mode_status}\n"
+            f"🤖 {t('auto_trade', lang)}: {auto_trade_status}\n"
             # Language display line removed
             f"🔄 {t('scanning', lang)}: {scanning_status}\n"
             f"💱 {t('base_asset', lang)}: {cfg.base_asset}"
         )
         await msg.answer(text, reply_markup=kb_settings_menu(lang))
+
+    @dp.message(F.text == "/autotrade")
+    async def on_autotrade(msg: Message):
+        cfg, _ = await sync_to_async(BotSettings.objects.get_or_create)(id=1)
+        lang = cfg.bot_language if cfg.bot_language else S.BOT_LANGUAGE
+        cfg.auto_trade_enabled = not cfg.auto_trade_enabled
+        await sync_to_async(cfg.save)()
+        status_text = t('enabled', lang) if cfg.auto_trade_enabled else t('disabled', lang)
+        status_emoji = "✅" if cfg.auto_trade_enabled else "❌"
+        await msg.answer(f"{status_emoji} {t('auto_trade', lang)}: {status_text}")
 
     @dp.message(F.text == "/triangular_alerts")
     async def on_tri_alerts(msg: Message):
@@ -335,6 +351,7 @@ async def main():
         status_text = (
             f"🤖 Bot Status\n\n"
             f"{status_emoji} {t('scanning', lang)}: {t('enabled', lang) if cfg.scanning_enabled else t('disabled', lang)}\n\n"
+            f"🤖 {t('auto_trade', lang)}: {t('enabled', lang) if cfg.auto_trade_enabled else t('disabled', lang)}\n\n"
             f"{binance_emoji} Binance: {binance_msg}\n\n"
             f"{symbols_line}"
             f"📊 Settings:\n"
@@ -530,6 +547,7 @@ async def main():
         # lang_display removed
         scanning_status = f"✅ {t('enabled', lang)}" if cfg.scanning_enabled else f"❌ {t('disabled', lang)}"
         balance_mode_status = f"✅ {t('enabled', lang)}" if cfg.use_entire_balance else f"❌ {t('disabled', lang)}"
+        auto_trade_status = f"✅ {t('enabled', lang)}" if cfg.auto_trade_enabled else f"❌ {t('disabled', lang)}"
         text = (
             f"{t('config_menu', lang)}\n\n"
             f"📊 {t('min_profit', lang)}: {cfg.min_profit_pct}%\n"
@@ -537,6 +555,7 @@ async def main():
             f"💰 {t('min_notional', lang)}: ${cfg.min_notional_usd:,.0f}\n"
             f"💰 {t('max_notional', lang)}: ${cfg.max_notional_usd:,.0f}\n"
             f"💵 {t('use_entire_balance', lang)}: {balance_mode_status}\n"
+            f"🤖 {t('auto_trade', lang)}: {auto_trade_status}\n"
             # Language display line removed
             f"🔄 {t('scanning', lang)}: {scanning_status}\n"
             f"💱 {t('base_asset', lang)}: {cfg.base_asset}"
@@ -566,6 +585,7 @@ async def main():
             # lang_display removed
             scanning_status = f"✅ {t('enabled', lang)}" if cfg.scanning_enabled else f"❌ {t('disabled', lang)}"
             balance_mode_status = f"✅ {t('enabled', lang)}" if cfg.use_entire_balance else f"❌ {t('disabled', lang)}"
+            auto_trade_status = f"✅ {t('enabled', lang)}" if cfg.auto_trade_enabled else f"❌ {t('disabled', lang)}"
             text = (
                 f"{t('config_menu', lang)}\n\n"
                 f"📊 {t('min_profit', lang)}: {cfg.min_profit_pct}%\n"
@@ -573,6 +593,7 @@ async def main():
                 f"💰 {t('min_notional', lang)}: ${cfg.min_notional_usd:,.0f}\n"
                 f"💰 {t('max_notional', lang)}: ${cfg.max_notional_usd:,.0f}\n"
                 f"💵 {t('use_entire_balance', lang)}: {balance_mode_status}\n"
+                f"🤖 {t('auto_trade', lang)}: {auto_trade_status}\n"
                 # Language display line removed
                 f"🔄 {t('scanning', lang)}: {scanning_status}\n"
                 f"💱 {t('base_asset', lang)}: {cfg.base_asset}"
@@ -590,6 +611,7 @@ async def main():
             # lang_display removed
             scanning_status = f"✅ {t('enabled', lang)}" if cfg.scanning_enabled else f"❌ {t('disabled', lang)}"
             balance_mode_status = f"✅ {t('enabled', lang)}" if cfg.use_entire_balance else f"❌ {t('disabled', lang)}"
+            auto_trade_status = f"✅ {t('enabled', lang)}" if cfg.auto_trade_enabled else f"❌ {t('disabled', lang)}"
             text = (
                 f"{t('config_menu', lang)}\n\n"
                 f"📊 {t('min_profit', lang)}: {cfg.min_profit_pct}%\n"
@@ -597,7 +619,31 @@ async def main():
                 f"💰 {t('min_notional', lang)}: ${cfg.min_notional_usd:,.0f}\n"
                 f"💰 {t('max_notional', lang)}: ${cfg.max_notional_usd:,.0f}\n"
                 f"💵 {t('use_entire_balance', lang)}: {balance_mode_status}\n"
+                f"🤖 {t('auto_trade', lang)}: {auto_trade_status}\n"
                 # Language display line removed
+                f"🔄 {t('scanning', lang)}: {scanning_status}\n"
+                f"💱 {t('base_asset', lang)}: {cfg.base_asset}"
+            )
+            await cb.message.edit_text(text, reply_markup=kb_settings_menu(lang))
+            return
+
+        if setting == "auto_trade":
+            cfg.auto_trade_enabled = not cfg.auto_trade_enabled
+            await sync_to_async(cfg.save)()
+            auto_trade_status_text = t('enabled', lang) if cfg.auto_trade_enabled else t('disabled', lang)
+            await cb.answer(f"{t('auto_trade', lang)} {auto_trade_status_text}")
+
+            scanning_status = f"✅ {t('enabled', lang)}" if cfg.scanning_enabled else f"❌ {t('disabled', lang)}"
+            balance_mode_status = f"✅ {t('enabled', lang)}" if cfg.use_entire_balance else f"❌ {t('disabled', lang)}"
+            auto_trade_status = f"✅ {t('enabled', lang)}" if cfg.auto_trade_enabled else f"❌ {t('disabled', lang)}"
+            text = (
+                f"{t('config_menu', lang)}\n\n"
+                f"📊 {t('min_profit', lang)}: {cfg.min_profit_pct}%\n"
+                f"📊 {t('max_profit', lang)}: {cfg.max_profit_pct}%\n"
+                f"💰 {t('min_notional', lang)}: ${cfg.min_notional_usd:,.0f}\n"
+                f"💰 {t('max_notional', lang)}: ${cfg.max_notional_usd:,.0f}\n"
+                f"💵 {t('use_entire_balance', lang)}: {balance_mode_status}\n"
+                f"🤖 {t('auto_trade', lang)}: {auto_trade_status}\n"
                 f"🔄 {t('scanning', lang)}: {scanning_status}\n"
                 f"💱 {t('base_asset', lang)}: {cfg.base_asset}"
             )
@@ -678,6 +724,7 @@ async def main():
         # lang_display removed
         scanning_status = f"✅ {t('enabled', lang)}" if cfg.scanning_enabled else f"❌ {t('disabled', lang)}"
         balance_mode_status = f"✅ {t('enabled', lang)}" if cfg.use_entire_balance else f"❌ {t('disabled', lang)}"
+        auto_trade_status = f"✅ {t('enabled', lang)}" if cfg.auto_trade_enabled else f"❌ {t('disabled', lang)}"
         text = (
             f"{t('config_menu', lang)}\n\n"
             f"📊 {t('min_profit', lang)}: {cfg.min_profit_pct}%\n"
@@ -685,6 +732,7 @@ async def main():
             f"💰 {t('min_notional', lang)}: ${cfg.min_notional_usd:,.0f}\n"
             f"💰 {t('max_notional', lang)}: ${cfg.max_notional_usd:,.0f}\n"
             f"💵 {t('use_entire_balance', lang)}: {balance_mode_status}\n"
+            f"🤖 {t('auto_trade', lang)}: {auto_trade_status}\n"
             # Language display line removed
             f"🔄 {t('scanning', lang)}: {scanning_status}\n"
             f"💱 {t('base_asset', lang)}: {cfg.base_asset}"
