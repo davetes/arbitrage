@@ -170,10 +170,7 @@ def scan_triangular_routes():
                         [{"text": _t("exec", lang), "callback_data": f"exec:{r.id}"}],
                     ]
                 }
-                price_lines = _route_price_lines([r.leg_a, r.leg_b, r.leg_c])
-                price_block = "\n".join(price_lines)
                 text = (
-                    f"{price_block}\n\n"
                     f"Route: {r.leg_a} → {r.leg_b} → {r.leg_c}\n"
                     f"Profit: {r.profit_pct:.2f}%\n"
                     f"Volume: ${r.volume_usd:,.0f}\n"
@@ -247,7 +244,7 @@ def scan_triangular_routes():
             status_ts = float(symbols_status.get("ts", 0.0))
             if _should_alert_symbols(status_ts) and S.TELEGRAM_BOT_TOKEN and S.ADMIN_TELEGRAM_ID:
                 try:
-                    text = "Symbols API failed, using fallback"
+                    text = "Symbols API failed"
                     url = f"https://api.telegram.org/bot{S.TELEGRAM_BOT_TOKEN}/sendMessage"
                     payload = {
                         "chat_id": S.ADMIN_TELEGRAM_ID,

@@ -65,6 +65,19 @@ def _server_time_ms(client: "BinanceClient") -> int:
 
 def _signed_timestamp_ms(offset_ms: int = 0) -> int:
     return int(time.time() * 1000) + int(offset_ms or 0)
+    
+def _safe_new_order(client: "BinanceClient", **kwargs) -> dict:
+    recv_window_ms = int(getattr(S, "BINANCE_RECV_WINDOW_MS", 5000))
+    manual_offset_ms = int(getattr(S, "BINANCE_TIME_OFFSET_MS", 0))
+    try:
+        return client.new_order(recvWindow=recv_window_ms, **kwargs)
+    except Exception as exc:
+        if not _is_timestamp_error(exc):
+            raise
+        if hasattr(client, "timestamp_offset"):
+            client.timestamp_offset = manual_offset_ms or _server_time_offset_ms(client)
+        wide_recv_ms = max(recv_window_ms, 60000)
+        return client.new_order(recvWindow=wide_recv_ms, **kwargs)
 
 
 def get_account_balance(asset: str = None) -> Dict[str, float]:
@@ -252,7 +265,8 @@ def execute_cycle(route: CandidateRoute, notional_usd: float) -> Tuple[float, Li
             if effective_quote < min_notional:
                 raise RuntimeError(f"Amount {effective_quote} below min notional {min_notional} for {symbol}")
 
-            order = client.new_order(
+            order = _safe_new_order(
+                client,
                 symbol=symbol,
                 side="BUY",
                 type="MARKET",
@@ -289,7 +303,8 @@ def execute_cycle(route: CandidateRoute, notional_usd: float) -> Tuple[float, Li
                     f"available={available_qty}, step={step_size}, minQty={min_qty}"
                 )
 
-            order = client.new_order(
+            order = _safe_new_order(
+                client,
                 symbol=symbol,
                 side="SELL",
                 type="MARKET",
