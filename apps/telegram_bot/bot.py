@@ -56,6 +56,7 @@ def t(key: str, lang: str = None) -> str:
         "stop_search": "Stop Search",
         "check": "Check Validity",
         "exec": "Execute Trade",
+        "prices": "Live Prices",
         "settings_saved": "Settings saved",
         "min_profit": "Min Profit %",
         "max_profit": "Max Profit %",
@@ -145,23 +146,17 @@ def _format_balance_amount(amount: float) -> str:
 def _route_price_lines(legs):
     client = _client(timeout=10)
     lines = []
-    symbols = []
-    for leg in legs:
-        try:
-            base, quote, _ = _parse_leg(leg)
-            symbols.append(f"{base}{quote}")
-        except Exception:
-            continue
-    ensure_ws_symbols(list(dict.fromkeys(symbols)))
     for leg in legs:
         try:
             base, quote, side = _parse_leg(leg)
             symbol = f"{base}{quote}"
-            depth = _depth_snapshot(client, symbol, use_cache=True)
-            if not depth:
+            depth = client.depth(symbol, limit=5)
+            if not depth or not depth.get("asks") or not depth.get("bids"):
                 lines.append(f"{base}/{quote}: n/a {side}")
                 continue
-            price = depth["ask_price"] if side == "buy" else depth["bid_price"]
+            ask_price = float(depth["asks"][0][0])
+            bid_price = float(depth["bids"][0][0])
+            price = ask_price if side == "buy" else bid_price
             lines.append(f"{base}/{quote}: {_format_price_value(price)} {side}")
         except Exception:
             lines.append(f"{leg}: n/a")
@@ -232,6 +227,7 @@ async def kb_global():
 
 def kb_route(route_id: int, lang: str = None):
     return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=t("prices", lang), callback_data=f"prices:{route_id}")],
         [InlineKeyboardButton(text=t("check", lang), callback_data=f"check:{route_id}")],
         [InlineKeyboardButton(text=t("exec", lang), callback_data=f"exec:{route_id}")],
     ])
@@ -675,6 +671,31 @@ async def main():
                 await cb.answer(t("revalidated", lang))
         except Exception as e:
             logging.error(f"Error checking route {route_id}: {e}", exc_info=True)
+            await cb.answer(f"Error: {str(e)[:100]}", show_alert=True)
+
+    @dp.callback_query(F.data.startswith("prices:"))
+    async def show_prices(cb: CallbackQuery):
+        cfg, _ = await sync_to_async(BotSettings.objects.get_or_create)(id=1)
+        lang = "en"
+        route_id = int(cb.data.split(":")[1])
+        r = await sync_to_async(lambda: Route.objects.filter(id=route_id).first())()
+        if not r:
+            await cb.answer(t("route_missing", lang), show_alert=True)
+            return
+
+        try:
+            price_lines = await sync_to_async(_route_price_lines)([r.leg_a, r.leg_b, r.leg_c])
+            price_block = "\n".join(price_lines)
+            text = (
+                f"{price_block}\n\n"
+                f"Route: {r.leg_a} → {r.leg_b} → {r.leg_c}\n"
+                f"Profit: {r.profit_pct:.2f}%\n"
+                f"Volume: ${r.volume_usd:,.0f}"
+            )
+            await cb.message.edit_text(text, reply_markup=kb_route(route_id, lang))
+            await cb.answer()
+        except Exception as e:
+            logging.error(f"Error fetching live prices for route {route_id}: {e}", exc_info=True)
             await cb.answer(f"Error: {str(e)[:100]}", show_alert=True)
 
     @dp.callback_query(F.data.startswith("exec:"))

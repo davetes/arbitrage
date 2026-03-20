@@ -314,6 +314,14 @@ def _depth_snapshot(client: BinanceClient, symbol: str, depth: int = 5, use_cach
     return None
 
 
+def get_cached_depth(symbol: str) -> Optional[dict]:
+    """Return cached depth without making network calls."""
+    ws_data = _book_ticker_stream.get(symbol)
+    if ws_data:
+        return ws_data
+    return _depth_cache.get(symbol)
+
+
 def _calculate_fee_pct() -> float:
     """Calculate total fee percentage for 3 legs"""
     fee_per_leg = (S.FEE_RATE_BPS + S.EXTRA_FEE_BPS) / 100.0  # BPS to percentage

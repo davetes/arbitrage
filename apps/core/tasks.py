@@ -7,7 +7,7 @@ import requests
 import logging
 import redis
 from .models import BotSettings, Route, Execution
-from .arbitrage import find_candidate_routes, _parse_leg, _client, _depth_snapshot, CandidateRoute, revalidate_route, ensure_ws_symbols
+from .arbitrage import find_candidate_routes, _parse_leg, _client, CandidateRoute, revalidate_route
 from .symbol_loader import get_symbol_status
 from .trading import execute_cycle, get_account_balance
 
@@ -49,6 +49,7 @@ def _t(key: str, lang: str = None) -> str:
     en = {
         "check": "Check Validity",
         "exec": "Execute Trade",
+        "prices": "Live Prices",
     }
     return en.get(key)
 
@@ -64,27 +65,23 @@ def _format_price_value(price: float) -> str:
 def _route_price_lines(legs):
     client = _client(timeout=10)
     lines = []
-    symbols = []
-    for leg in legs:
-        try:
-            base, quote, _ = _parse_leg(leg)
-            symbols.append(f"{base}{quote}")
-        except Exception:
-            continue
-    ensure_ws_symbols(list(dict.fromkeys(symbols)))
     for leg in legs:
         try:
             base, quote, side = _parse_leg(leg)
             symbol = f"{base}{quote}"
-            depth = _depth_snapshot(client, symbol, use_cache=True)
-            if not depth:
+            depth = client.depth(symbol, limit=5)
+            if not depth or not depth.get("asks") or not depth.get("bids"):
                 lines.append(f"{base}/{quote}: n/a {side}")
                 continue
-            price = depth["ask_price"] if side == "buy" else depth["bid_price"]
+            ask_price = float(depth["asks"][0][0])
+            bid_price = float(depth["bids"][0][0])
+            price = ask_price if side == "buy" else bid_price
             lines.append(f"{base}/{quote}: {_format_price_value(price)} {side}")
         except Exception:
             lines.append(f"{leg}: n/a")
     return lines
+
+
 
 
 def _send_telegram_message(text: str, reply_markup: dict = None) -> None:
@@ -166,6 +163,7 @@ def scan_triangular_routes():
             try:
                 kb = {
                     "inline_keyboard": [
+                        [{"text": _t("prices", lang), "callback_data": f"prices:{r.id}"}],
                         [{"text": _t("check", lang), "callback_data": f"check:{r.id}"}],
                         [{"text": _t("exec", lang), "callback_data": f"exec:{r.id}"}],
                     ]
