@@ -89,7 +89,8 @@ def _route_price_lines(legs):
 
 
 def _send_telegram_message(text: str, reply_markup: dict = None) -> None:
-    if not (S.TELEGRAM_BOT_TOKEN and S.ADMIN_TELEGRAM_ID):
+    if not S.TELEGRAM_BOT_TOKEN or not S.ADMIN_TELEGRAM_ID:
+        logger.warning("Telegram not configured: missing TELEGRAM_BOT_TOKEN or ADMIN_TELEGRAM_ID")
         return
     payload = {
         "chat_id": S.ADMIN_TELEGRAM_ID,
@@ -99,7 +100,16 @@ def _send_telegram_message(text: str, reply_markup: dict = None) -> None:
     if reply_markup:
         payload["reply_markup"] = json.dumps(reply_markup)
     url = f"https://api.telegram.org/bot{S.TELEGRAM_BOT_TOKEN}/sendMessage"
-    requests.post(url, data=payload, timeout=10)
+    try:
+        resp = requests.post(url, data=payload, timeout=10)
+        if not resp.ok:
+            logger.error(
+                "Telegram sendMessage failed: status=%s body=%s",
+                resp.status_code,
+                resp.text[:200],
+            )
+    except Exception as exc:
+        logger.error("Telegram sendMessage error: %s", exc, exc_info=True)
 
 
 @shared_task

@@ -98,6 +98,8 @@ REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379/0")
 CELERY_BROKER_URL = REDIS_URL
 CELERY_RESULT_BACKEND = REDIS_URL
 CELERY_BROKER_CONNECTION_RETRY_ON_STARTUP = True
+CELERY_WORKER_POOL = os.getenv("CELERY_WORKER_POOL", "threads" if os.name == "nt" else "prefork")
+CELERY_WORKER_CONCURRENCY = int(os.getenv("CELERY_WORKER_CONCURRENCY", "4"))
 
 # Bot settings
 BINANCE_API_KEY = os.getenv("BINANCE_API_KEY", "")
