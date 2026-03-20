@@ -148,6 +148,16 @@ def _floor_to_step(qty: Decimal, step: Decimal) -> Decimal:
     return (steps * step).normalize()
 
 
+def _format_qty(qty: Decimal, step: Decimal) -> str:
+    """Format quantity to LOT_SIZE step as a plain string (no scientific notation)."""
+    if step <= 0:
+        return format(qty, "f")
+    stepped = _floor_to_step(qty, step)
+    stepped = stepped.quantize(step, rounding=ROUND_DOWN)
+    text = format(stepped, "f")
+    return text.rstrip("0").rstrip(".") or "0"
+
+
 def _as_decimal(x: float | Decimal) -> Decimal:
     return x if isinstance(x, Decimal) else Decimal(str(x))
 
@@ -270,7 +280,7 @@ def execute_cycle(route: CandidateRoute, notional_usd: float) -> Tuple[float, Li
                 symbol=symbol,
                 side="BUY",
                 type="MARKET",
-                quoteOrderQty=float(effective_quote),
+                quoteOrderQty=_format_qty(effective_quote, Decimal("0.00000001")),
             )
 
             # Ensure FULL fill before continuing
@@ -308,7 +318,7 @@ def execute_cycle(route: CandidateRoute, notional_usd: float) -> Tuple[float, Li
                 symbol=symbol,
                 side="SELL",
                 type="MARKET",
-                quantity=float(sell_qty),
+                quantity=_format_qty(sell_qty, step_size),
             )
 
             order_id = int(order.get("orderId"))
