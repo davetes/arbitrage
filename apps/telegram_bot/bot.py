@@ -30,10 +30,8 @@ from apps.core.tasks import scan_triangular_routes
 
 def t(key: str, lang: str = None) -> str:
     """Translation function. Always returns English."""
-    # Force English
+    # Force English regardless of input
     lang = "en"
-
-    
     en = {
         "ready": "Arbitrage bot ready. Use buttons to control scanning.",
         "config": "Bot Settings",
@@ -88,7 +86,6 @@ def t(key: str, lang: str = None) -> str:
         "no_routes_found": "No profitable routes found in this scan",
         "routes_saved": "route(s) saved to database",
     }
-    # Directly return English text
     return en.get(key, key)
 
 
@@ -166,7 +163,7 @@ def _route_price_lines(legs):
 
 async def kb_global():
     cfg, _ = await sync_to_async(BotSettings.objects.get_or_create)(id=1)
-    lang = cfg.bot_language if cfg.bot_language else S.BOT_LANGUAGE
+    lang = "en"
     if cfg.scanning_enabled:
         return InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text=t("stop_search", lang), callback_data="toggle_scan")]])
     else:
@@ -262,10 +259,7 @@ async def main():
     @dp.message(CommandStart())
     async def on_start(msg: Message):
         cfg, _ = await sync_to_async(BotSettings.objects.get_or_create)(id=1)
-        if not cfg.bot_language:
-            cfg.bot_language = S.BOT_LANGUAGE
-            await sync_to_async(cfg.save)()
-        lang = cfg.bot_language
+        lang = "en"
         reply_kb = await kb_global()
         logging.info(f"/start from chat_id={msg.chat.id} username={getattr(msg.from_user, 'username', '')}")
         
@@ -312,10 +306,7 @@ async def main():
     @dp.message(F.text == "/config")
     async def on_config(msg: Message):
         cfg, _ = await sync_to_async(BotSettings.objects.get_or_create)(id=1)
-        if not cfg.bot_language:
-            cfg.bot_language = S.BOT_LANGUAGE
-            await sync_to_async(cfg.save)()
-        lang = cfg.bot_language
+        lang = "en"
         # lang_display removed
         scanning_status = f"✅ {t('enabled', lang)}" if cfg.scanning_enabled else f"❌ {t('disabled', lang)}"
         balance_mode_status = f"✅ {t('enabled', lang)}" if cfg.use_entire_balance else f"❌ {t('disabled', lang)}"
@@ -337,7 +328,7 @@ async def main():
     @dp.message(F.text == "/autotrade")
     async def on_autotrade(msg: Message):
         cfg, _ = await sync_to_async(BotSettings.objects.get_or_create)(id=1)
-        lang = cfg.bot_language if cfg.bot_language else S.BOT_LANGUAGE
+        lang = "en"
         cfg.auto_trade_enabled = not cfg.auto_trade_enabled
         await sync_to_async(cfg.save)()
         status_text = t('enabled', lang) if cfg.auto_trade_enabled else t('disabled', lang)
@@ -347,25 +338,25 @@ async def main():
     @dp.message(F.text == "/triangular_alerts")
     async def on_tri_alerts(msg: Message):
         cfg, _ = await sync_to_async(BotSettings.objects.get_or_create)(id=1)
-        lang = cfg.bot_language if cfg.bot_language else S.BOT_LANGUAGE
+        lang = "en"
         await msg.answer(t("tri", lang))
 
     @dp.message(F.text == "/direct_alerts")
     async def on_direct_alerts(msg: Message):
         cfg, _ = await sync_to_async(BotSettings.objects.get_or_create)(id=1)
-        lang = cfg.bot_language if cfg.bot_language else S.BOT_LANGUAGE
+        lang = "en"
         await msg.answer(t("direct", lang))
 
     @dp.message(F.text == "/transaction_history")
     async def on_tx_history(msg: Message):
         cfg, _ = await sync_to_async(BotSettings.objects.get_or_create)(id=1)
-        lang = cfg.bot_language if cfg.bot_language else S.BOT_LANGUAGE
+        lang = "en"
         await msg.answer(t("history", lang))
 
     @dp.message(F.text == "/top_routes")
     async def on_top_routes(msg: Message):
         cfg, _ = await sync_to_async(BotSettings.objects.get_or_create)(id=1)
-        lang = cfg.bot_language if cfg.bot_language else S.BOT_LANGUAGE
+        lang = "en"
         routes = await sync_to_async(lambda: list(Route.objects.order_by('-profit_pct')[:10]))()
         if not routes:
             await msg.answer("No routes found yet.")
@@ -383,7 +374,7 @@ async def main():
     async def on_status(msg: Message):
         """Check bot status and configuration"""
         cfg, _ = await sync_to_async(BotSettings.objects.get_or_create)(id=1)
-        lang = cfg.bot_language if cfg.bot_language else S.BOT_LANGUAGE
+        lang = "en"
         status_emoji = "✅" if cfg.scanning_enabled else "❌"
         base_text = (
             f"🤖 Bot Status\n\n"
@@ -451,7 +442,7 @@ async def main():
     async def toggle_scan(cb: CallbackQuery):
         try:
             cfg, _ = await sync_to_async(BotSettings.objects.get_or_create)(id=1)
-            lang = cfg.bot_language if cfg.bot_language else S.BOT_LANGUAGE
+            lang = "en"
             old_status = cfg.scanning_enabled
             cfg.scanning_enabled = not cfg.scanning_enabled
             await sync_to_async(cfg.save)()
@@ -500,7 +491,7 @@ async def main():
     @dp.callback_query(F.data.startswith("check:"))
     async def check_route(cb: CallbackQuery):
         cfg, _ = await sync_to_async(BotSettings.objects.get_or_create)(id=1)
-        lang = cfg.bot_language if cfg.bot_language else S.BOT_LANGUAGE
+        lang = "en"
         route_id = int(cb.data.split(":")[1])
         r = await sync_to_async(lambda: Route.objects.filter(id=route_id).first())()
         if not r:
@@ -541,7 +532,7 @@ async def main():
     @dp.callback_query(F.data.startswith("exec:"))
     async def exec_route(cb: CallbackQuery):
         cfg, _ = await sync_to_async(BotSettings.objects.get_or_create)(id=1)
-        lang = cfg.bot_language if cfg.bot_language else S.BOT_LANGUAGE
+        lang = "en"
         route_id = int(cb.data.split(":")[1])
         r = await sync_to_async(lambda: Route.objects.filter(id=route_id).first())()
         if not r:
@@ -604,17 +595,14 @@ async def main():
     @dp.callback_query(F.data.startswith("execcancel:"))
     async def exec_cancel(cb: CallbackQuery):
         cfg, _ = await sync_to_async(BotSettings.objects.get_or_create)(id=1)
-        lang = cfg.bot_language if cfg.bot_language else S.BOT_LANGUAGE
+        lang = "en"
         await cb.answer(t("cancelled", lang))
         await cb.message.edit_text(t("cancelled", lang))
 
     @dp.callback_query(F.data == "config:back")
     async def config_back(cb: CallbackQuery):
         cfg, _ = await sync_to_async(BotSettings.objects.get_or_create)(id=1)
-        if not cfg.bot_language:
-            cfg.bot_language = S.BOT_LANGUAGE
-            await sync_to_async(cfg.save)()
-        lang = cfg.bot_language
+        lang = "en"
         # lang_display removed
         scanning_status = f"✅ {t('enabled', lang)}" if cfg.scanning_enabled else f"❌ {t('disabled', lang)}"
         balance_mode_status = f"✅ {t('enabled', lang)}" if cfg.use_entire_balance else f"❌ {t('disabled', lang)}"
@@ -641,10 +629,7 @@ async def main():
             return  # Handled separately
         
         cfg, _ = await sync_to_async(BotSettings.objects.get_or_create)(id=1)
-        if not cfg.bot_language:
-            cfg.bot_language = S.BOT_LANGUAGE
-            await sync_to_async(cfg.save)()
-        lang = cfg.bot_language
+        lang = "en"
         
         if setting == "toggle_scan":
             cfg.scanning_enabled = not cfg.scanning_enabled
@@ -758,10 +743,7 @@ async def main():
         new_value_str = parts[2]
         
         cfg, _ = await sync_to_async(BotSettings.objects.get_or_create)(id=1)
-        if not cfg.bot_language:
-            cfg.bot_language = S.BOT_LANGUAGE
-            await sync_to_async(cfg.save)()
-        lang = cfg.bot_language
+        lang = "en"
         
         # Handle language setting (disabled)
         if setting == "language":
@@ -813,7 +795,7 @@ async def main():
     @dp.callback_query(F.data.startswith("execok:"))
     async def exec_ok(cb: CallbackQuery):
         cfg, _ = await sync_to_async(BotSettings.objects.get_or_create)(id=1)
-        lang = cfg.bot_language if cfg.bot_language else S.BOT_LANGUAGE
+        lang = "en"
         route_id = int(cb.data.split(":")[1])
         r = await sync_to_async(lambda: Route.objects.filter(id=route_id).first())()
         if not r:

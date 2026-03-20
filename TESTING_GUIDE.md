@@ -229,22 +229,7 @@ The bot should handle network issues automatically:
 
 ---
 
-## Test 9: Russian Language Support
-
-### Step 1: Set Language
-In `.env`: `BOT_LANGUAGE=ru`
-
-### Step 2: Restart Bot
-Restart Telegram bot to pick up new language.
-
-### Step 3: Send /start
-**Expected Result:**
-- All messages in Russian
-- Buttons in Russian
-
----
-
-## Test 10: Database Verification
+## Test 9: Database Verification
 
 ### Check Routes in Database
 ```powershell

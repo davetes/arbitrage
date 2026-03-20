@@ -45,25 +45,13 @@ def _should_alert_symbols(status_ts: float) -> bool:
 def _t(key: str, lang: str = None) -> str:
     """Translation helper for tasks (matches bot.py t() function)"""
     if lang is None:
-        # Try to get from database
-        try:
-            cfg = BotSettings.objects.filter(id=1).first()
-            if cfg and cfg.bot_language:
-                lang = cfg.bot_language
-            else:
-                lang = S.BOT_LANGUAGE
-        except Exception:
-            lang = S.BOT_LANGUAGE
-    
-    ru = {
-        "check": "Проверить актуальность",
-        "exec": "Исполнить сделку",
-    }
+        lang = "en"
+
     en = {
         "check": "Check Validity",
         "exec": "Execute Trade",
     }
-    return ru.get(key) if lang and lang.lower().startswith("ru") else en.get(key)
+    return en.get(key)
 
 
 def _format_price_value(price: float) -> str:
@@ -128,7 +116,6 @@ def scan_triangular_routes():
             "min_notional_usd": S.MIN_NOTIONAL_USD,
             "max_notional_usd": S.MAX_NOTIONAL_USD,
             "base_asset": S.BASE_ASSET,
-            "bot_language": S.BOT_LANGUAGE,
         })
         if not cfg.scanning_enabled:
             logger.info("Scanning is disabled, skipping route search")
@@ -176,7 +163,7 @@ def scan_triangular_routes():
         logger.info(f"Found {len(candidates)} candidate routes")
         
         created = 0
-        lang = cfg.bot_language if cfg.bot_language else S.BOT_LANGUAGE
+        lang = "en"
         with transaction.atomic():
             for c in candidates:
                 r = Route.objects.create(
