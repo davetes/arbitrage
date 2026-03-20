@@ -53,14 +53,6 @@ def get_symbol_status():
 class FastSymbolLoader:
     """Optimized symbol loader with caching and bridge-quote filtering"""
     
-    # Major trading pairs as fallback if API fails
-    MAJOR_PAIRS = [
-        "BTC", "ETH", "BNB", "SOL", "ADA", "XRP", "DOGE", "MATIC",
-        "AVAX", "DOT", "LINK", "UNI", "ATOM", "LTC", "ETC", "XLM",
-        "ALGO", "VET", "FIL", "TRX", "EOS", "AAVE", "SXP", "CHZ",
-        "BICO", "LISTA", "APT", "ARB", "OP", "SUI", "SEI", "TIA"
-    ]
-    
     def __init__(self, cache_ttl_seconds: int = 300):
         """
         Initialize FastSymbolLoader
@@ -71,25 +63,6 @@ class FastSymbolLoader:
         self.cache_ttl = cache_ttl_seconds
         self._cache: Optional[Dict[str, dict]] = None
         self._cache_timestamp: float = 0.0
-    
-    def _create_fallback_symbols(self, base_asset: str = "USDT") -> Dict[str, dict]:
-        """Create fallback symbol dict from major pairs if API fails"""
-        symbols = {}
-        for asset in self.MAJOR_PAIRS:
-            if asset == base_asset:
-                continue
-            # Create both directions: ASSETUSDT and USDTASSET (though USDTASSET is rare)
-            symbol1 = f"{asset}{base_asset}"
-            symbol2 = f"{base_asset}{asset}"
-            symbols[symbol1] = {
-                "symbol": symbol1,
-                "baseAsset": asset,
-                "quoteAsset": base_asset,
-                "status": "TRADING"
-            }
-            # Only add reverse if it's a common pattern (usually not needed)
-            # Most pairs are ASSET/USDT, not USDT/ASSET
-        return symbols
     
     def _filter_and_extract(
         self, 
@@ -111,8 +84,6 @@ class FastSymbolLoader:
         """
         filtered = {}
         base_upper = base_asset.upper()
-        major_assets = {asset.upper() for asset in self.MAJOR_PAIRS}
-        major_assets.add(base_upper)  # Include base asset
         # Bridge quotes we want to keep to build triangles: include common quotes
         bridge_quotes = {base_upper, "BTC", "ETH", "BNB", "FDUSD", "USDC"}
         invalid_count = 0
@@ -228,17 +199,15 @@ class FastSymbolLoader:
                     time.sleep(backoff)
                     backoff *= 2
         
-        # If all attempts failed, use fallback
-        logger.warning(
-            f"All API attempts failed, using fallback symbols ({len(self.MAJOR_PAIRS)} pairs). "
-            f"Last error: {last_err}"
+        # If all attempts failed, do not use fallback
+        logger.error(
+            "All API attempts failed; no symbols loaded. Last error: %s",
+            last_err,
         )
-        _set_symbol_status(False, "Symbols API failed, using fallback")
-        fallback = self._create_fallback_symbols(base_asset)
-        # Cache fallback too (but with shorter TTL would be better, keeping same for simplicity)
-        self._cache = fallback
-        self._cache_timestamp = time.time()
-        return fallback.copy()
+        _set_symbol_status(False, "Symbols API failed; no fallback in use")
+        self._cache = None
+        self._cache_timestamp = 0.0
+        return {}
     
     def clear_cache(self):
         """Clear the symbol cache"""
