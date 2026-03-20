@@ -962,10 +962,6 @@ async def main():
         if not new_cand:
             await cb.answer(t("not_valid", lang), show_alert=True)
             return
-        if not S.TRADING_ENABLED:
-            await cb.answer(t("trade_disabled", lang), show_alert=True)
-            return
-        
         # Calculate executable amount
         # Re-check balance right before execution (balance may have changed)
         try:

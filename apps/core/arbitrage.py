@@ -7,7 +7,7 @@ Features:
 - Thread-safe parallel execution
 """
 from dataclasses import dataclass
-from typing import List, Optional, Dict, Tuple
+from typing import List, Optional, Dict, Tuple, Callable
 from binance.spot import Spot as BinanceClient
 try:
     from binance.websocket.spot.websocket_stream import SpotWebsocketStreamClient
@@ -524,7 +524,7 @@ def _try_triangle_pattern(
     # Check if best profit is in target range
     if best_route and min_profit_pct <= best_route.profit_pct <= max_profit_pct:
         update_stats("routes_found")
-        logger.info(
+        logger.debug(
             f"FOUND: {best_route.a} → {best_route.b} → {best_route.c}, "
             f"net: {best_route.profit_pct}%, gross: {best_route.gross_profit_pct}%, "
             f"volume: ${best_route.volume_usd}"
@@ -542,7 +542,8 @@ def find_candidate_routes(
     max_profit_pct: float,
     available_balance: float = None,
     max_routes: int = 10,
-    use_parallel: bool = True
+    use_parallel: bool = True,
+    on_route_found: Optional[Callable[[CandidateRoute], None]] = None
 ) -> Tuple[List[CandidateRoute], dict]:
     """
     Find triangular arbitrage opportunities with fee-adjusted profits.
@@ -672,6 +673,8 @@ def find_candidate_routes(
                             if not any(r.a == route.a and r.b == route.b and r.c == route.c for r in cand):
                                 cand.append(route)
                                 logger.info(f"✅ Route #{len(cand)}: {route.profit_pct}% net profit")
+                                if on_route_found:
+                                    on_route_found(route)
                     except Exception as e:
                         logger.debug(f"Triangle check failed: {e}")
                     
@@ -696,6 +699,8 @@ def find_candidate_routes(
                 if route:
                     if not any(r.a == route.a and r.b == route.b and r.c == route.c for r in cand):
                         cand.append(route)
+                        if on_route_found:
+                            on_route_found(route)
                 
                 if i % 100 == 0:
                     elapsed = time.time() - start_time

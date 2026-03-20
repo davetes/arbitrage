@@ -225,9 +225,6 @@ def execute_cycle(route: CandidateRoute, notional_usd: float) -> Tuple[float, Li
     Returns (final_base_amount, orders).
     """
 
-    if not S.TRADING_ENABLED:
-        raise RuntimeError("Trading disabled. Set TRADING_ENABLED=true to allow live orders.")
-
     client = _client_auth()
     symbols = _load_symbols(client)
 

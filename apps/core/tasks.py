@@ -1,7 +1,6 @@
 import os
 from celery import shared_task
 from django.utils import timezone
-from django.db import transaction
 from arbbot import settings as S
 import json
 import requests
@@ -148,10 +147,99 @@ def scan_triangular_routes():
                 logger.warning(f"Balance check failed: {e}, falling back to normal behavior")
                 available_balance = None
 
+        created = 0
+        lang = "en"
+
+        def _handle_candidate(c: CandidateRoute):
+            nonlocal created
+            r = Route.objects.create(
+                leg_a=c.a,
+                leg_b=c.b,
+                leg_c=c.c,
+                profit_pct=c.profit_pct,
+                volume_usd=c.volume_usd,
+            )
+            created += 1
+            logger.info(
+                f"Created route {r.id}: {r.label()} (profit: {r.profit_pct:.4f}%, volume: ${r.volume_usd:,.2f})"
+            )
+            try:
+                kb = {
+                    "inline_keyboard": [
+                        [{"text": _t("check", lang), "callback_data": f"check:{r.id}"}],
+                        [{"text": _t("exec", lang), "callback_data": f"exec:{r.id}"}],
+                    ]
+                }
+                price_lines = _route_price_lines([r.leg_a, r.leg_b, r.leg_c])
+                price_block = "\n".join(price_lines)
+                text = (
+                    f"{price_block}\n\n"
+                    f"Route: {r.leg_a} → {r.leg_b} → {r.leg_c}\n"
+                    f"Profit: {r.profit_pct:.2f}%\n"
+                    f"Volume: ${r.volume_usd:,.0f}\n"
+                    f"Auto-trade: {'enabled' if cfg.auto_trade_enabled else 'disabled'}"
+                )
+                _send_telegram_message(text, reply_markup=kb)
+                logger.info(f"Telegram notification sent for route {r.id}")
+            except Exception as e:
+                logger.error(f"Failed to send Telegram notification for route {r.id}: {e}", exc_info=True)
+
+            if cfg.auto_trade_enabled:
+                try:
+                    cand = CandidateRoute(
+                        a=r.leg_a,
+                        b=r.leg_b,
+                        c=r.leg_c,
+                        profit_pct=r.profit_pct,
+                        volume_usd=r.volume_usd,
+                    )
+                    new_cand = revalidate_route(cand)
+                    if not new_cand:
+                        logger.info(f"Auto-trade skipped (route invalid) for route {r.id}")
+                    else:
+                        balances = get_account_balance(S.BASE_ASSET.upper())
+                        available = balances.get(S.BASE_ASSET.upper(), 0.0)
+                        if cfg.use_entire_balance:
+                            notional = available * 0.95
+                            notional = min(notional, new_cand.volume_usd, S.MAX_NOTIONAL_USD)
+                        else:
+                            notional = min(new_cand.volume_usd, S.MAX_NOTIONAL_USD, available)
+
+                        if notional < S.MIN_NOTIONAL_USD:
+                            logger.info(
+                                f"Auto-trade skipped (insufficient balance) for route {r.id}: ${notional:.2f}"
+                            )
+                        else:
+                            ex = Execution.objects.create(route=r, status="running", notional_usd=notional)
+                            try:
+                                final_base, orders = execute_cycle(new_cand, notional)
+                                pnl = final_base - notional
+                                ex.status = "completed"
+                                ex.pnl_usd = pnl
+                                ex.finished_at = timezone.now()
+                                ex.details = {"orders": orders, "final_base": final_base}
+                                _send_telegram_message(
+                                    f"✅ Auto-trade executed\nRoute: {r.leg_a} → {r.leg_b} → {r.leg_c}\n"
+                                    f"Notional: ${notional:,.2f}\nP&L: ${pnl:,.2f}"
+                                )
+                            except Exception as e:
+                                ex.status = "failed"
+                                ex.details = {"error": str(e)}
+                                ex.finished_at = timezone.now()
+                                _send_telegram_message(
+                                    f"❌ Auto-trade failed\nRoute: {r.leg_a} → {r.leg_b} → {r.leg_c}\n"
+                                    f"Error: {e}"
+                                )
+                            finally:
+                                ex.save()
+                except Exception as e:
+                    logger.error(f"Auto-trade failed for route {r.id}: {e}", exc_info=True)
+
         candidates, stats = find_candidate_routes(
             min_profit_pct=cfg.min_profit_pct,
             max_profit_pct=cfg.max_profit_pct,
             available_balance=available_balance,
+            on_route_found=_handle_candidate,
         )
 
         symbols_status = get_symbol_status()
@@ -172,94 +260,6 @@ def scan_triangular_routes():
         
         logger.info(f"Found {len(candidates)} candidate routes")
         
-        created = 0
-        lang = "en"
-        with transaction.atomic():
-            for c in candidates:
-                r = Route.objects.create(
-                    leg_a=c.a,
-                    leg_b=c.b,
-                    leg_c=c.c,
-                    profit_pct=c.profit_pct,
-                    volume_usd=c.volume_usd,
-                )
-                created += 1
-                logger.info(f"Created route {r.id}: {r.label()} (profit: {r.profit_pct:.4f}%, volume: ${r.volume_usd:,.2f})")
-                # Notify Telegram immediately with inline buttons
-                try:
-                    kb = {
-                        "inline_keyboard": [
-                            [{"text": _t("check", lang), "callback_data": f"check:{r.id}"}],
-                            [{"text": _t("exec", lang), "callback_data": f"exec:{r.id}"}],
-                        ]
-                    }
-                    price_lines = _route_price_lines([r.leg_a, r.leg_b, r.leg_c])
-                    price_block = "\n".join(price_lines)
-                    text = (
-                        f"{price_block}\n\n"
-                        f"Route: {r.leg_a} → {r.leg_b} → {r.leg_c}\n"
-                        f"Profit: {r.profit_pct:.2f}%\n"
-                        f"Volume: ${r.volume_usd:,.0f}\n"
-                        f"Auto-trade: {'enabled' if cfg.auto_trade_enabled else 'disabled'}"
-                    )
-                    _send_telegram_message(text, reply_markup=kb)
-                    logger.info(f"Telegram notification sent for route {r.id}")
-                except Exception as e:
-                    logger.error(f"Failed to send Telegram notification for route {r.id}: {e}", exc_info=True)
-
-                if cfg.auto_trade_enabled:
-                    if not S.TRADING_ENABLED:
-                        logger.warning("Auto-trade enabled but TRADING_ENABLED is false")
-                    else:
-                        try:
-                            cand = CandidateRoute(
-                                a=r.leg_a,
-                                b=r.leg_b,
-                                c=r.leg_c,
-                                profit_pct=r.profit_pct,
-                                volume_usd=r.volume_usd,
-                            )
-                            new_cand = revalidate_route(cand)
-                            if not new_cand:
-                                logger.info(f"Auto-trade skipped (route invalid) for route {r.id}")
-                            else:
-                                balances = get_account_balance(S.BASE_ASSET.upper())
-                                available_balance = balances.get(S.BASE_ASSET.upper(), 0.0)
-                                if cfg.use_entire_balance:
-                                    notional = available_balance * 0.95
-                                    notional = min(notional, new_cand.volume_usd, S.MAX_NOTIONAL_USD)
-                                else:
-                                    notional = min(new_cand.volume_usd, S.MAX_NOTIONAL_USD, available_balance)
-
-                                if notional < S.MIN_NOTIONAL_USD:
-                                    logger.info(
-                                        f"Auto-trade skipped (insufficient balance) for route {r.id}: ${notional:.2f}"
-                                    )
-                                else:
-                                    ex = Execution.objects.create(route=r, status="running", notional_usd=notional)
-                                    try:
-                                        final_base, orders = execute_cycle(new_cand, notional)
-                                        pnl = final_base - notional
-                                        ex.status = "completed"
-                                        ex.pnl_usd = pnl
-                                        ex.finished_at = timezone.now()
-                                        ex.details = {"orders": orders, "final_base": final_base}
-                                        _send_telegram_message(
-                                            f"✅ Auto-trade executed\nRoute: {r.leg_a} → {r.leg_b} → {r.leg_c}\n"
-                                            f"Notional: ${notional:,.2f}\nP&L: ${pnl:,.2f}"
-                                        )
-                                    except Exception as e:
-                                        ex.status = "failed"
-                                        ex.details = {"error": str(e)}
-                                        ex.finished_at = timezone.now()
-                                        _send_telegram_message(
-                                            f"❌ Auto-trade failed\nRoute: {r.leg_a} → {r.leg_b} → {r.leg_c}\n"
-                                            f"Error: {e}"
-                                        )
-                                    finally:
-                                        ex.save()
-                        except Exception as e:
-                            logger.error(f"Auto-trade failed for route {r.id}: {e}", exc_info=True)
         
         # Send summary message to Telegram only when at least one route was created
         try:
