@@ -21,6 +21,7 @@ from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKe
 from aiogram.exceptions import TelegramBadRequest
 from django.utils import timezone
 from arbbot import settings as S
+from arbbot.celery import app as celery_app
 from apps.core.models import BotSettings, Route, Execution
 from apps.core.arbitrage import CandidateRoute, revalidate_route, _parse_leg, _client, _depth_snapshot, ensure_ws_symbols, get_ws_stats
 from apps.core.trading import execute_cycle, get_account_balance
@@ -167,6 +168,59 @@ def _route_price_lines(legs):
     return lines
 
 
+def _get_celery_status():
+    broker_url = getattr(S, "CELERY_BROKER_URL", "") or getattr(S, "REDIS_URL", "")
+    redis_ok = None
+    redis_error = None
+    inspect_error = None
+
+    if broker_url:
+        try:
+            client = redis.from_url(
+                broker_url,
+                decode_responses=True,
+                socket_connect_timeout=1.5,
+                socket_timeout=1.5,
+            )
+            redis_ok = bool(client.ping())
+        except Exception as exc:
+            redis_ok = False
+            redis_error = str(exc)
+
+    workers = []
+    active_count = 0
+    scheduled_count = 0
+
+    try:
+        replies = celery_app.control.ping(timeout=2.0) or []
+        for item in replies:
+            if isinstance(item, dict):
+                workers.extend(item.keys())
+        workers = sorted(set(workers))
+    except Exception as exc:
+        inspect_error = str(exc)
+
+    if workers:
+        try:
+            insp = celery_app.control.inspect(timeout=2.0)
+            active = insp.active() or {}
+            scheduled = insp.scheduled() or {}
+            active_count = sum(len(v or []) for v in active.values())
+            scheduled_count = sum(len(v or []) for v in scheduled.values())
+        except Exception as exc:
+            inspect_error = str(exc)
+
+    return {
+        "broker_url": broker_url,
+        "redis_ok": redis_ok,
+        "redis_error": redis_error,
+        "workers": workers,
+        "active_count": active_count,
+        "scheduled_count": scheduled_count,
+        "inspect_error": inspect_error,
+    }
+
+
 async def kb_global():
     cfg, _ = await sync_to_async(BotSettings.objects.get_or_create)(id=1)
     lang = "en"
@@ -210,7 +264,7 @@ def kb_setting_presets(setting: str, current_val: float, unit: str, lang: str = 
     """Create preset buttons for a setting"""
     if "%" in unit:
         # Profit percentage presets
-        presets = [0.01, 0.1, 0.5, 1.0, 2.0, 2.5, 5.0]
+        presets = [-2.0, -1.0, -0.5, 0.0, 0.5, 1.0, 2.0, 5.0, 10.0]
     else:
         # Notional USD presets
         presets = [1, 10, 50, 100, 500, 1000, 5000, 10000]
@@ -257,6 +311,7 @@ async def main():
         BotCommand(command="autotrade", description="Toggle auto trade"),
         BotCommand(command="balance", description="Show base asset balance"),
         BotCommand(command="balances", description="Show all balances"),
+        BotCommand(command="celery_status", description="Check Celery worker/beat"),
         BotCommand(command="top_routes", description="Show top 10 routes"),
         BotCommand(command="triangular_alerts", description="Get triangular arbitrage alerts"),
         BotCommand(command="direct_alerts", description="Get direct arbitrage alerts"),
@@ -388,6 +443,47 @@ async def main():
             lines.append(f"... and {len(rows) - 15} more")
         await msg.answer("\n".join(lines))
 
+    @dp.message(F.text == "/celery_status")
+    async def on_celery_status(msg: Message):
+        sent = await msg.answer("Checking Celery status...")
+        try:
+            status = await asyncio.wait_for(
+                sync_to_async(_get_celery_status)(),
+                timeout=6.0,
+            )
+        except asyncio.TimeoutError:
+            await sent.edit_text("Celery status check timed out.")
+            return
+
+        broker_url = status.get("broker_url") or "(not set)"
+        redis_ok = status.get("redis_ok")
+        redis_error = status.get("redis_error")
+        workers = status.get("workers", [])
+        active_count = status.get("active_count", 0)
+        scheduled_count = status.get("scheduled_count", 0)
+
+        lines = ["Celery Status", f"Broker: {broker_url}"]
+
+        if redis_ok is True:
+            lines.append("Redis: OK")
+        elif redis_ok is False:
+            lines.append(f"Redis: ERROR ({redis_error})")
+
+        if status.get("inspect_error"):
+            lines.append(f"Inspect error: {status['inspect_error']}")
+
+        if workers:
+            lines.extend([
+                f"Workers online: {len(workers)}",
+                f"Active tasks: {active_count}",
+                f"Scheduled tasks: {scheduled_count}",
+                "Beat: not directly detectable; scheduled tasks > 0 suggests beat is running",
+            ])
+        else:
+            lines.append("Workers online: 0")
+
+        await sent.edit_text("\n".join(lines))
+
     @dp.message(F.text == "/triangular_alerts")
     async def on_tri_alerts(msg: Message):
         cfg, _ = await sync_to_async(BotSettings.objects.get_or_create)(id=1)
@@ -514,7 +610,6 @@ async def main():
                     f"🔍 {t('scan_started', lang)}\n\n"
                     f"📊 Profit range: {cfg.min_profit_pct}% - {cfg.max_profit_pct}%\n"
                     f"💰 Volume: ${cfg.min_notional_usd:,.0f} - ${cfg.max_notional_usd:,.0f}\n\n"
-                    f"💡 Make sure Celery worker and beat are running!\n\n"
                     f"📈 You will receive scan summaries after each scan cycle."
                 )
             else:
@@ -822,6 +917,14 @@ async def main():
                 return
             
             field_name, unit = setting_map[setting]
+
+            if field_name in ("min_profit_pct", "max_profit_pct"):
+                new_value = max(-2.0, min(10.0, new_value))
+                if field_name == "min_profit_pct" and new_value > cfg.max_profit_pct:
+                    cfg.max_profit_pct = new_value
+                if field_name == "max_profit_pct" and new_value < cfg.min_profit_pct:
+                    cfg.min_profit_pct = new_value
+
             setattr(cfg, field_name, new_value)
             await sync_to_async(cfg.save)()
             await cb.answer(f"{t('settings_saved', lang)}: {new_value}{unit}")
