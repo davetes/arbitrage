@@ -89,6 +89,9 @@ DEFAULT_AUTO_FIELD = "django.db.models.BigAutoField"
 BINANCE_BASE_URL = os.getenv("BINANCE_BASE_URL", "https://api.binance.com")
 # Example: PROXY_URL=http://127.0.0.1:7890 or socks5://127.0.0.1:1080
 PROXY_URL = os.getenv("PROXY_URL", "")
+BINANCE_TIMEOUT_SECONDS = float(os.getenv("BINANCE_TIMEOUT_SECONDS", "10"))
+BINANCE_RECV_WINDOW_MS = int(os.getenv("BINANCE_RECV_WINDOW_MS", "5000"))
+BINANCE_TIME_OFFSET_MS = int(os.getenv("BINANCE_TIME_OFFSET_MS", "0"))
 
 # Celery/Redis
 REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379/0")

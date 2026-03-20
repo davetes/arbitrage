@@ -17,7 +17,54 @@ def _client_auth() -> "BinanceClient":
         raise RuntimeError("binance-connector is not installed; cannot execute live trades")
     if not (S.BINANCE_API_KEY and S.BINANCE_API_SECRET):
         raise RuntimeError("Binance API keys are required for execution")
-    return BinanceClient(api_key=S.BINANCE_API_KEY, api_secret=S.BINANCE_API_SECRET)
+    proxies = None
+    if getattr(S, "PROXY_URL", ""):
+        proxies = {"http": S.PROXY_URL, "https": S.PROXY_URL}
+    timeout = float(getattr(S, "BINANCE_TIMEOUT_SECONDS", 10))
+    client = BinanceClient(
+        api_key=S.BINANCE_API_KEY,
+        api_secret=S.BINANCE_API_SECRET,
+        base_url=getattr(S, "BINANCE_BASE_URL", None),
+        timeout=timeout,
+        proxies=proxies,
+    )
+    try:
+        if hasattr(client, "timestamp_offset"):
+            server = client.time()
+            server_ms = int(server.get("serverTime", 0) or 0)
+            if server_ms:
+                client.timestamp_offset = server_ms - int(time.time() * 1000)
+    except Exception:
+        pass
+    return client
+
+
+def _is_timestamp_error(exc: Exception) -> bool:
+    msg = str(exc)
+    return "-1021" in msg or "Timestamp for this request" in msg
+
+
+def _server_time_offset_ms(client: "BinanceClient") -> int:
+    try:
+        server = client.time()
+        server_ms = int(server.get("serverTime", 0) or 0)
+        if not server_ms:
+            return 0
+        return server_ms - int(time.time() * 1000)
+    except Exception:
+        return 0
+
+
+def _server_time_ms(client: "BinanceClient") -> int:
+    try:
+        server = client.time()
+        return int(server.get("serverTime", 0) or 0)
+    except Exception:
+        return 0
+
+
+def _signed_timestamp_ms(offset_ms: int = 0) -> int:
+    return int(time.time() * 1000) + int(offset_ms or 0)
 
 
 def get_account_balance(asset: str = None) -> Dict[str, float]:
@@ -28,7 +75,25 @@ def get_account_balance(asset: str = None) -> Dict[str, float]:
     """
 
     client = _client_auth()
-    account = client.account()
+    recv_window_ms = int(getattr(S, "BINANCE_RECV_WINDOW_MS", 5000))
+    manual_offset_ms = int(getattr(S, "BINANCE_TIME_OFFSET_MS", 0))
+    try:
+        server_ms = _server_time_ms(client)
+        if server_ms:
+            timestamp = server_ms + manual_offset_ms
+            account = client.account(timestamp=timestamp, recvWindow=recv_window_ms)
+        else:
+            if hasattr(client, "timestamp_offset"):
+                client.timestamp_offset = manual_offset_ms or _server_time_offset_ms(client)
+            account = client.account(recvWindow=recv_window_ms)
+    except Exception as exc:
+        if _is_timestamp_error(exc):
+            server_ms = _server_time_ms(client)
+            timestamp = server_ms + manual_offset_ms if server_ms else _signed_timestamp_ms(manual_offset_ms)
+            wide_recv_ms = max(recv_window_ms, 60000)
+            account = client.account(timestamp=timestamp, recvWindow=wide_recv_ms)
+        else:
+            raise
     balances = {}
     for bal in account.get("balances", []):
         free = float(bal.get("free", 0))

@@ -135,6 +135,12 @@ def _format_price_value(price: float) -> str:
     return f"{price:.8f}"
 
 
+def _format_balance_amount(amount: float) -> str:
+    if amount >= 1:
+        return f"{amount:,.6f}".rstrip("0").rstrip(".")
+    return f"{amount:.8f}".rstrip("0").rstrip(".")
+
+
 def _route_price_lines(legs):
     client = _client(timeout=10)
     lines = []
@@ -249,6 +255,8 @@ async def main():
         BotCommand(command="start", description="Start the arbitrage bot"),
         BotCommand(command="config", description="Configure your bot settings"),
         BotCommand(command="autotrade", description="Toggle auto trade"),
+        BotCommand(command="balance", description="Show base asset balance"),
+        BotCommand(command="balances", description="Show all balances"),
         BotCommand(command="top_routes", description="Show top 10 routes"),
         BotCommand(command="triangular_alerts", description="Get triangular arbitrage alerts"),
         BotCommand(command="direct_alerts", description="Get direct arbitrage alerts"),
@@ -334,6 +342,51 @@ async def main():
         status_text = t('enabled', lang) if cfg.auto_trade_enabled else t('disabled', lang)
         status_emoji = "✅" if cfg.auto_trade_enabled else "❌"
         await msg.answer(f"{status_emoji} {t('auto_trade', lang)}: {status_text}")
+
+    @dp.message(F.text == "/balance")
+    async def on_balance(msg: Message):
+        cfg, _ = await sync_to_async(BotSettings.objects.get_or_create)(id=1)
+        base_asset = (cfg.base_asset or S.BASE_ASSET or "").upper()
+        if not base_asset:
+            await msg.answer("Base asset is not configured.")
+            return
+        try:
+            balances = await asyncio.wait_for(
+                sync_to_async(get_account_balance)(base_asset),
+                timeout=float(getattr(S, "BINANCE_TIMEOUT_SECONDS", 10)),
+            )
+            amount = balances.get(base_asset, 0.0)
+            await msg.answer(f"Balance {base_asset}: {_format_balance_amount(amount)}")
+        except asyncio.TimeoutError:
+            await msg.answer("Balance check timed out. Please try again.")
+        except Exception as exc:
+            await msg.answer(f"Balance check failed: {exc}")
+
+    @dp.message(F.text == "/balances")
+    async def on_balances(msg: Message):
+        try:
+            balances = await asyncio.wait_for(
+                sync_to_async(get_account_balance)(),
+                timeout=float(getattr(S, "BINANCE_TIMEOUT_SECONDS", 10)),
+            )
+        except asyncio.TimeoutError:
+            await msg.answer("Balance check timed out. Please try again.")
+            return
+        except Exception as exc:
+            await msg.answer(f"Balance check failed: {exc}")
+            return
+
+        if not balances:
+            await msg.answer("No balances found.")
+            return
+
+        rows = sorted(balances.items(), key=lambda item: item[1], reverse=True)
+        lines = ["Balances"]
+        for asset, amount in rows[:15]:
+            lines.append(f"{asset}: {_format_balance_amount(amount)}")
+        if len(rows) > 15:
+            lines.append(f"... and {len(rows) - 15} more")
+        await msg.answer("\n".join(lines))
 
     @dp.message(F.text == "/triangular_alerts")
     async def on_tri_alerts(msg: Message):
