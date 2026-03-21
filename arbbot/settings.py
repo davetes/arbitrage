@@ -100,6 +100,11 @@ CELERY_RESULT_BACKEND = REDIS_URL
 CELERY_BROKER_CONNECTION_RETRY_ON_STARTUP = True
 CELERY_WORKER_POOL = os.getenv("CELERY_WORKER_POOL", "threads" if os.name == "nt" else "prefork")
 CELERY_WORKER_CONCURRENCY = int(os.getenv("CELERY_WORKER_CONCURRENCY", "4"))
+CELERY_TASK_DEFAULT_QUEUE = "scan"
+CELERY_TASK_ROUTES = {
+    "apps.core.tasks.scan_triangular_routes": {"queue": "scan"},
+    "apps.core.tasks.auto_trade_route": {"queue": "trade"},
+}
 
 # Bot settings
 BINANCE_API_KEY = os.getenv("BINANCE_API_KEY", "")

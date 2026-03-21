@@ -1,4 +1,4 @@
 web: python manage.py migrate && gunicorn arbbot.wsgi:application --bind 0.0.0.0:$PORT
-worker: celery -A arbbot worker -l info
+worker: celery -A arbbot worker -l info -Q scan,trade -n worker@%h
 beat: celery -A arbbot beat -l info
 bot: python apps/telegram_bot/bot.py

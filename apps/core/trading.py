@@ -275,12 +275,36 @@ def execute_cycle(route: CandidateRoute, notional_usd: float) -> Tuple[float, Li
             if effective_quote < min_notional:
                 raise RuntimeError(f"Amount {effective_quote} below min notional {min_notional} for {symbol}")
 
+            base_qty = None
+            try:
+                depth = client.depth(symbol, limit=5)
+                if depth and depth.get("asks"):
+                    ask_price = Decimal(str(depth["asks"][0][0]))
+                    if ask_price > 0:
+                        base_qty = _floor_to_step(effective_quote / ask_price, step_size)
+            except Exception:
+                base_qty = None
+
+            if base_qty is None or base_qty <= 0:
+                try:
+                    last_price = client.ticker_price(symbol=symbol)
+                    price_val = Decimal(str(last_price.get("price", "0")))
+                    if price_val > 0:
+                        base_qty = _floor_to_step(effective_quote / price_val, step_size)
+                except Exception:
+                    base_qty = None
+
+            if base_qty is None or base_qty <= 0 or (min_qty > 0 and base_qty < min_qty):
+                raise RuntimeError(
+                    f"Amount {base_qty or 0} below min qty {min_qty} for {symbol}"
+                )
+
             order = _safe_new_order(
                 client,
                 symbol=symbol,
                 side="BUY",
                 type="MARKET",
-                quoteOrderQty=_format_qty(effective_quote, Decimal("0.00000001")),
+                quantity=_format_qty(base_qty, step_size),
             )
 
             # Ensure FULL fill before continuing

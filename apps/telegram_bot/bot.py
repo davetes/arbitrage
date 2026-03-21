@@ -496,7 +496,31 @@ async def main():
     async def on_tx_history(msg: Message):
         cfg, _ = await sync_to_async(BotSettings.objects.get_or_create)(id=1)
         lang = "en"
-        await msg.answer(t("history", lang))
+        executions = await sync_to_async(lambda: list(Execution.objects.select_related("route").order_by("-started_at")))()
+        if not executions:
+            await msg.answer(t("history", lang))
+            return
+
+        lines = ["📜 Execution History"]
+        for ex in executions:
+            route_label = ex.route.label() if ex.route_id else "(no route)"
+            started = ex.started_at.strftime("%Y-%m-%d %H:%M:%S") if ex.started_at else "n/a"
+            pnl = f"${ex.pnl_usd:,.2f}" if ex.pnl_usd is not None else "n/a"
+            lines.append(
+                f"#{ex.id} {started} | {ex.status} | Notional: ${ex.notional_usd:,.2f} | P&L: {pnl}\n"
+                f"{route_label}"
+            )
+
+        # Telegram message size limit ~4096; keep a safe margin
+        max_len = 3500
+        chunk = ""
+        for line in lines:
+            if len(chunk) + len(line) + 1 > max_len:
+                await msg.answer(chunk)
+                chunk = ""
+            chunk = f"{chunk}\n{line}" if chunk else line
+        if chunk:
+            await msg.answer(chunk)
 
     @dp.message(F.text == "/top_routes")
     async def on_top_routes(msg: Message):
